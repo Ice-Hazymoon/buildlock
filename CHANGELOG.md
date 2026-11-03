@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- On bash 5.1 (Ubuntu 22.04, Debian 11, RHEL 9), a waiter stopped with Ctrl-Z never woke after `fg` or SIGCONT: bash resumed its paused read without the timeout.
+- Light jobs that hold back for a heavy job starved of memory said so poorly ("13.4 GB for this job" for `true`), and `status` and `explain` claimed they would start. The verdicts now count that reserve, and the message names it.
+
 ## 0.2.0
 
 A release from a five-part review (first use, transparency, robustness, coding agents, docs and release).
