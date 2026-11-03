@@ -3664,7 +3664,9 @@ main() {
     # so when it starts (`buildlock: waited Ns` is a stable format scripts
     # parse); slots count from 1, and past the lane's normal count only an idle
     # machine lets a job in.
-    waited=$(( job_started - queued_at ))
+    # Measured in microseconds: whole seconds would call 20 ms across a second
+    # boundary "waited 1s".
+    waited=$(( (${EPOCHREALTIME/[.,]/} - queued_us) / 1000000 ))
     if (( waited >= 1 || announced == 1 )); then
         lane_word=''
         lane_slots="$slots"

@@ -699,15 +699,17 @@ test('a kill -9 of buildlock does not leave its command running outside the queu
 }, 15_000);
 
 test('a heavy job starved of memory gets its budget kept free by light jobs', async () => {
-    const { env } = sandbox({ BUILDLOCK_SLOTS: '2', BUILDLOCK_LIGHT_SLOTS: '2', BUILDLOCK_RESERVE_MEMORY_MB: '2048' });
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '2', BUILDLOCK_LIGHT_SLOTS: '2', BUILDLOCK_RESERVE_MEMORY_MB: '2048', BUILDLOCK_HEAVY_STARVE_SECONDS: '1' });
     const holder = spawn(script, ['sleep', '2'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     try {
         await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
         const light = ['run', '--light', '--timeout', '0.5', 'true'];
         expect(run(light, env).code).toBe(0);
-        // A heavy head (pid 1 stands in: alive since long before) waiting 2 minutes for 40 GB.
-        const since = Math.floor(Date.now() / 1000) - 120;
-        writeFileSync(`${env.BUILDLOCK_LOCK_PATH}.heavywait`, `1\t${since}\t40000\n`);
+        // A heavy head waiting longer than the starvation limit for 40 GB. The
+        // test process stands in for it: alive, and started before `since` + 60 s
+        // (pid 1 is not, on a CI machine booted a minute ago).
+        const since = Math.floor(Date.now() / 1000) - 5;
+        writeFileSync(`${env.BUILDLOCK_LOCK_PATH}.heavywait`, `${process.pid}\t${since}\t40000\n`);
         const starved = run(light, env);
         expect(starved.code).toBe(73);
         expect(starved.stderr).toContain('not enough free memory');
