@@ -1075,6 +1075,33 @@ invoked_path() {
     printf '%s/%s' "$(cd "$(dirname -- "$p")" && pwd)" "${p##*/}"
 }
 
+# A copy that npm, pnpm, bun or yarn installed is updated and removed by that
+# package manager, not by buildlock. Succeeds for one and sets pm_kind (global,
+# project or temporary), pm_update and pm_remove (the commands to suggest), and
+# pm_where (the project, for a project dependency).
+package_manager_copy() {
+    local real
+    real="$(self_path)"
+    pm_kind='' pm_update='' pm_remove='' pm_where=''
+    [[ "$real" == */node_modules/buildlock/bin/buildlock ]] || return 1
+    case "$real" in
+        */_npx/*|*/bunx-*|*/pnpm/dlx/*|*/dlx-*)
+            pm_kind=temporary pm_update='npx buildlock@latest (or bunx, pnpm dlx)' ;;
+        */.bun/install/global/*)
+            pm_kind=global pm_update='bun add -g buildlock@latest' pm_remove='bun remove -g buildlock' ;;
+        */pnpm/global/*)
+            pm_kind=global pm_update='pnpm add -g buildlock@latest' pm_remove='pnpm remove -g buildlock' ;;
+        */yarn/global/*)
+            pm_kind=global pm_update='yarn global add buildlock@latest' pm_remove='yarn global remove buildlock' ;;
+        */lib/node_modules/buildlock/*)
+            pm_kind=global pm_update='npm install -g buildlock@latest' pm_remove='npm uninstall -g buildlock' ;;
+        *)
+            pm_kind=project pm_where="${real%%/node_modules/*}"
+            pm_update='npm install -D buildlock@latest (or the same with your package manager)'
+            pm_remove='npm uninstall buildlock (or the same with your package manager)' ;;
+    esac
+}
+
 # Total RAM in MB from meminfo.
 total_ram_mb() { awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' "$proc_root/meminfo" 2>/dev/null || printf 0; }
 
@@ -2872,6 +2899,13 @@ cmd_doctor() {
     heading "This installation"
     self="$(self_path)"
     ok "running $(short_path "$self" 70)"
+    if package_manager_copy; then
+        case "$pm_kind" in
+            temporary) note "    from a package runner's cache; agents and scripts start faster with a global install (npm install -g buildlock)" ;;
+            project) note "    a dependency of $(short_path "$pm_where" 50); update it there: $pm_update" ;;
+            *) note "    installed with a package manager; update: $pm_update" ;;
+        esac
+    fi
     mapfile -t path_hits < <(type -a -P buildlock 2>/dev/null | awk '!seen[$0]++')
     if (( ${#path_hits[@]} == 0 )); then
         warn "buildlock is not on PATH; add $(short_path "$(dirname "$self")" 50) to PATH"
@@ -2955,7 +2989,7 @@ fetch() {
 }
 
 cmd_update() {
-    local check=0 version=latest force=0 base self dir tmp sum new_version
+    local check=0 version=latest force=0 base self dir tmp sum new_version how
     while (( $# > 0 )); do
         case "$1" in
             --check) check=1 ;;
@@ -2975,7 +3009,17 @@ cmd_update() {
     base="${BUILDLOCK_RELEASES_URL:-$bl_home/releases}"
     if [[ "$version" == latest ]]; then base+=/latest/download; else base+="/download/$version"; fi
     self="$(invoked_path)"
-    if [[ -L "$self" ]]; then
+    how='buildlock update'
+    if package_manager_copy; then
+        how="$pm_update"
+        if (( check == 0 )); then
+            case "$pm_kind" in
+                temporary) die "this copy runs from a package runner's cache; $pm_update runs the newest release" ;;
+                project) die "buildlock is a dependency of $pm_where; update it there: $pm_update" ;;
+                *) die "this copy was installed with a package manager; update it with: $pm_update" ;;
+            esac
+        fi
+    elif [[ -L "$self" && "$check" == 0 ]]; then
         die "$self is a symlink to $(readlink -f "$self"); update that copy instead (e.g. git pull)"
     fi
     dir="$(dirname "$self")"
@@ -2995,7 +3039,7 @@ cmd_update() {
         return 0
     fi
     if (( check == 1 )); then
-        printf 'Update available: %s -> %s (run: buildlock update)\n' "$bl_version" "$new_version"
+        printf 'Update available: %s -> %s (run: %s)\n' "$bl_version" "$new_version" "$how"
         return 0
     fi
     [[ -w "$dir" ]] || die "cannot write $dir; rerun with permission to replace $self"
@@ -3007,7 +3051,7 @@ cmd_update() {
 }
 
 cmd_uninstall() {
-    local yes=0 purge=0 keep_agents=0 self holders queued
+    local yes=0 purge=0 keep_agents=0 self holders queued managed=0
     while (( $# > 0 )); do
         case "$1" in
             -y|--yes) yes=1 ;;
@@ -3019,16 +3063,25 @@ cmd_uninstall() {
         shift
     done
     self="$(invoked_path)"
+    # A package manager's copy is left to it: removing only the file would leave
+    # the package behind, half installed.
+    if package_manager_copy; then
+        managed=1
+        if (( keep_agents == 1 && purge == 0 )); then
+            if [[ -n "$pm_remove" ]]; then printf 'Remove buildlock with: %s\n' "$pm_remove"; else printf "Nothing to remove: this copy lives in a package runner's cache.\n"; fi
+            return 0
+        fi
+    fi
     [[ "${self##*/}" == *buildlock* ]] || die "refusing to remove $self"
     # Checked before anything is removed, so a failure never leaves half an uninstall.
-    if [[ ! -w "$(dirname "$self")" ]]; then
+    if (( managed == 0 )) && [[ ! -w "$(dirname "$self")" ]]; then
         die "buildlock is in $(dirname "$self"), which you can't write. Run \"buildlock agents uninstall\" as yourself, then: sudo rm $self"
     fi
     if (( EUID == 0 )) && [[ -n "${SUDO_USER:-}" ]]; then
         warn "running as root through sudo: agent files, config and job log are root's, not $SUDO_USER's."
     fi
     printf '%sThis removes:%s\n' "$c_bold" "$c_reset"
-    printf '  %s\n' "$(short_path "$self" 70)"
+    (( managed == 1 )) || printf '  %s\n' "$(short_path "$self" 70)"
     (( keep_agents == 1 )) || printf '  buildlock instructions in your coding agents'"'"' global files and the Claude Code permissions it added\n'
 
     if (( purge == 1 )); then
@@ -3057,7 +3110,13 @@ cmd_uninstall() {
         rmdir -- "$job_log_dir" 2>/dev/null || true
         ok "config, job log and lock files removed"
     fi
-    if [[ -L "$self" ]]; then
+    if (( managed == 1 )); then
+        if [[ -n "$pm_remove" ]]; then
+            note "Now remove the package itself: $pm_remove"
+        else
+            note "This copy lives in a package runner's cache; there is nothing else to remove."
+        fi
+    elif [[ -L "$self" ]]; then
         local link_target
         link_target="$(readlink -f "$self" 2>/dev/null || true)"
         rm -f -- "$self"
@@ -3068,7 +3127,7 @@ cmd_uninstall() {
     fi
     (( purge == 1 )) || note "The config and job log stay (--purge removes them)."
     (( keep_agents == 1 )) || note "Project files (AGENTS.md, ...) keep their section; it tells agents to run commands directly without buildlock."
-    note "Reinstall: curl -fsSL $bl_home/releases/latest/download/install.sh | bash"
+    (( managed == 1 )) || note "Reinstall: curl -fsSL $bl_home/releases/latest/download/install.sh | bash"
 }
 
 # ---------------------------------------------------------------------------

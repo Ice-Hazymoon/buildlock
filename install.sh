@@ -78,6 +78,9 @@ main() {
 then run \"sudo buildlock update\" to update it, and \"buildlock setup\" as yourself."
     fi
     if [[ -L "$target" && "$force" == 0 ]]; then
+        if [[ "$(readlink -f "$target")" == */node_modules/buildlock/* ]]; then
+            die "$target comes from a package manager (npm install -g buildlock); update it with npm install -g buildlock@latest, or rerun with --force to replace the link"
+        fi
         die "$target is a symlink to $(readlink -f "$target"); update that copy instead, or rerun with --force to replace the link"
     fi
     if [[ -f "$target" && ! -L "$target" && "$force" == 0 ]] && ! grep -q buildlock "$target" 2>/dev/null; then

@@ -33,7 +33,8 @@ Add fields at the end of JSON output instead of changing existing ones.
 ## Releases
 
 1. Add a `## X.Y.Z` section at the top of `CHANGELOG.md`.
-2. `scripts/release.sh X.Y.Z` sets the version, runs the checks, commits and tags.
+2. `scripts/release.sh X.Y.Z` sets the version (in `bin/buildlock` and
+   `package.json`), runs the checks, commits and tags.
 3. `git push origin HEAD vX.Y.Z`. GitHub Actions tests the tag, publishes the
-   release with checksums and provenance, then installs it with the one-line
-   installer.
+   release with checksums and provenance and the npm package through npm's
+   trusted publishing (no token), then installs both as users do.

@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Ice-Hazymoon/buildlock/actions/workflows/ci.yml/badge.svg)](https://github.com/Ice-Hazymoon/buildlock/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Ice-Hazymoon/buildlock)](https://github.com/Ice-Hazymoon/buildlock/releases/latest)
+[![npm](https://img.shields.io/npm/v/buildlock)](https://www.npmjs.com/package/buildlock)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A machine-wide queue for heavy commands, for Linux and WSL 2. Put `buildlock` in front of a full build, type-check or test run, and it waits until the machine has room for it, then runs it unchanged: same output, same exit code.
@@ -44,6 +45,14 @@ curl -fsSL https://github.com/Ice-Hazymoon/buildlock/releases/latest/download/in
 | `--no-setup` | don't offer the guided setup |
 | `--from FILE` | install a local copy of `bin/buildlock` |
 | `--force` | replace a symlink, or a file that is not buildlock, at the target |
+
+Or from npm (the package is the same script; Node.js is not used when it runs):
+
+```sh
+npm install -g buildlock      # or: pnpm add -g buildlock, bun add -g buildlock
+```
+
+Update an npm install with `npm install -g buildlock@latest`; `buildlock update` and `buildlock uninstall` tell you the command for the package manager that installed it. `npx buildlock …` works too, but it resolves the package on every call: install it globally for agents and scripts.
 
 For every user of the machine, install into a root-owned directory with `sudo bash` (`... | sudo bash -s -- --prefix /usr/local/bin --yes`), update it with `sudo buildlock update`, and run `buildlock setup` and `buildlock agents install` as yourself.
 
@@ -310,6 +319,8 @@ These interfaces are stable across versions:
 buildlock uninstall            # the program, its section in agents' global files, its Claude Code rules
 buildlock uninstall --purge    # also the config, the job log and the lock files
 ```
+
+Installed with npm, pnpm or bun, `buildlock uninstall` cleans up the same and then tells you the package manager's command (`npm uninstall -g buildlock`) for the program itself.
 
 Project files keep their section, since it tells agents to run commands directly where buildlock is missing; `buildlock agents uninstall --project` inside a project removes it. `--keep-agents` leaves the agents' files alone.
 

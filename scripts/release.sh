@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Prepares a release: scripts/release.sh 0.2.1
 #
-# Sets bl_version in bin/buildlock, checks that CHANGELOG.md has a "## 0.2.1"
+# Sets bl_version in bin/buildlock and the version in package.json, checks
+# that CHANGELOG.md has a "## 0.2.1"
 # section, runs the checks, commits and tags v0.2.1. Pushing the tag
 # (git push origin main v0.2.1) publishes the release from GitHub Actions.
 set -euo pipefail
@@ -14,6 +15,7 @@ git rev-parse -q --verify "refs/tags/v$version" > /dev/null && { echo "tag v$ver
 grep -qx "## $version" CHANGELOG.md || { echo "CHANGELOG.md needs a '## $version' section" >&2; exit 1; }
 
 sed -i "s/^bl_version=.*/bl_version=$version/" bin/buildlock
+sed -i -E "0,/\"version\": \"[^\"]*\"/s//\"version\": \"$version\"/" package.json
 shellcheck bin/buildlock install.sh scripts/release.sh
 if command -v buildlock > /dev/null; then BUILDLOCK_CLASS=light buildlock bun test; else bun test; fi
 

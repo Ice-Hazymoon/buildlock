@@ -1,8 +1,41 @@
 {
     "name": "buildlock",
-    "private": true,
+    "version": "0.2.1",
     "description": "A machine-wide queue for heavy commands, so many terminals and coding agents can share one machine.",
+    "keywords": [
+        "build",
+        "queue",
+        "scheduler",
+        "lock",
+        "concurrency",
+        "monorepo",
+        "typecheck",
+        "vitest",
+        "coding-agents",
+        "claude-code",
+        "codex",
+        "linux"
+    ],
+    "homepage": "https://github.com/Ice-Hazymoon/buildlock#readme",
+    "bugs": "https://github.com/Ice-Hazymoon/buildlock/issues",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/Ice-Hazymoon/buildlock.git"
+    },
     "license": "MIT",
+    "author": "Ice-Hazymoon",
+    "bin": {
+        "buildlock": "bin/buildlock"
+    },
+    "files": [
+        "bin/buildlock",
+        "examples/config",
+        "README.zh-CN.md",
+        "CHANGELOG.md"
+    ],
+    "os": [
+        "linux"
+    ],
     "scripts": {
         "test": "bun test",
         "lint": "shellcheck bin/buildlock install.sh scripts/release.sh"

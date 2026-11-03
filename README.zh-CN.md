@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Ice-Hazymoon/buildlock/actions/workflows/ci.yml/badge.svg)](https://github.com/Ice-Hazymoon/buildlock/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Ice-Hazymoon/buildlock)](https://github.com/Ice-Hazymoon/buildlock/releases/latest)
+[![npm](https://img.shields.io/npm/v/buildlock)](https://www.npmjs.com/package/buildlock)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 整机共享的重任务队列，适用于 Linux 和 WSL 2。在完整构建、类型检查或测试命令前加上 `buildlock`，它会等机器有余力时再原样运行：输出和退出码都不变。
@@ -44,6 +45,14 @@ curl -fsSL https://github.com/Ice-Hazymoon/buildlock/releases/latest/download/in
 | `--no-setup` | 不询问引导设置 |
 | `--from FILE` | 安装本地的 `bin/buildlock` |
 | `--force` | 目标位置是软链接、或者不是 buildlock 的文件时，也照样替换 |
+
+也可以从 npm 安装（包里就是同一个脚本，运行时不需要 Node.js）：
+
+```sh
+npm install -g buildlock      # 或者 pnpm add -g buildlock、bun add -g buildlock
+```
+
+npm 装的版本用 `npm install -g buildlock@latest` 升级；`buildlock update` 和 `buildlock uninstall` 会告诉你当初安装它的包管理器该用哪条命令。`npx buildlock …` 也能用，但每次调用都要解析一遍包，所以给 AI 工具和脚本用的话请全局安装。
 
 要给机器上所有用户安装，就装到 root 拥有的目录，用 `sudo bash` 运行（`... | sudo bash -s -- --prefix /usr/local/bin --yes`），之后用 `sudo buildlock update` 升级；`buildlock setup` 和 `buildlock agents install` 仍以你自己的身份运行。
 
@@ -267,6 +276,8 @@ fi
 buildlock uninstall            # 程序本身、各工具全局文件里的说明、它添加的 Claude Code 规则
 buildlock uninstall --purge    # 另外删除配置、任务日志和锁文件
 ```
+
+用 npm、pnpm 或 bun 安装的，`buildlock uninstall` 照样做清理，最后提示你用包管理器的命令（如 `npm uninstall -g buildlock`）删掉程序本身。
 
 项目文件里的说明会保留，因为它告诉 AI 工具在没有 buildlock 的机器上直接运行命令；要删掉的话，在项目里运行 `buildlock agents uninstall --project`。`--keep-agents` 表示不动 AI 工具的文件。
 

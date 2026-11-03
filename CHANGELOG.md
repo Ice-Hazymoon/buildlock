@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- On npm: `npm install -g buildlock` (or pnpm, bun). The package is the same script; releases publish it from GitHub Actions with provenance.
+- A copy installed by npm, pnpm, bun or yarn, or run through npx, is left to its package manager: `update` and `uninstall` name its command instead of replacing or deleting a file it manages, `update --check` still checks, and `doctor` says where the copy came from. The installer explains an npm link it finds at its target.
+
 ## 0.2.1
 
 - On bash 5.1 (Ubuntu 22.04, Debian 11, RHEL 9), a waiter stopped with Ctrl-Z never woke after `fg` or SIGCONT: bash resumed its paused read without the timeout.

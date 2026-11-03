@@ -877,3 +877,62 @@ test('install.sh expands ~ in --prefix=, refuses links and foreign files, and ex
         chmodSync(locked, 0o755);
     }
 });
+
+test('a copy that a package manager installed is left to that package manager', () => {
+    const { env, root, home } = sandbox();
+    const place = (dir: string) => {
+        mkdirSync(dir, { recursive: true });
+        copyFileSync(script, resolve(dir, 'buildlock'));
+        chmodSync(resolve(dir, 'buildlock'), 0o755);
+        return resolve(dir, 'buildlock');
+    };
+    // npm's global layout: <prefix>/bin/buildlock -> ../lib/node_modules/buildlock/bin/buildlock
+    const real = place(resolve(root, 'npm/lib/node_modules/buildlock/bin'));
+    mkdirSync(resolve(root, 'npm/bin'), { recursive: true });
+    const link = resolve(root, 'npm/bin/buildlock');
+    symlinkSync('../lib/node_modules/buildlock/bin/buildlock', link);
+    const update = spawnSync(link, ['update'], { env, encoding: 'utf8' });
+    expect(update.status).toBe(1);
+    expect(update.stderr).toContain('npm install -g buildlock@latest');
+    // --check still checks, and names the same command.
+    const release = resolve(root, 'release/latest/download');
+    mkdirSync(release, { recursive: true });
+    writeFileSync(resolve(release, 'buildlock'), readFileSync(script, 'utf8').replace(/^bl_version=.*$/m, 'bl_version=9.9.9'));
+    writeFileSync(resolve(release, 'buildlock.sha256'), spawnSync('sha256sum', ['buildlock'], { cwd: release, encoding: 'utf8' }).stdout);
+    const check = spawnSync(link, ['update', '--check'], { env: { ...env, BUILDLOCK_RELEASES_URL: `file://${resolve(root, 'release')}` }, encoding: 'utf8' });
+    expect(check.status).toBe(0);
+    expect(check.stdout).toContain('-> 9.9.9 (run: npm install -g buildlock@latest)');
+    expect(spawnSync(link, ['doctor'], { env, encoding: 'utf8' }).stdout).toContain('update: npm install -g buildlock@latest');
+    // Uninstall cleans up after buildlock but leaves the package to npm.
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    run(['agents', 'install', '--target', 'claude', '--yes'], env);
+    const removed = spawnSync(link, ['uninstall', '--yes'], { env, encoding: 'utf8' });
+    expect(removed.status).toBe(0);
+    expect(removed.stdout).toContain('npm uninstall -g buildlock');
+    expect(existsSync(link)).toBe(true);
+    expect(existsSync(real)).toBe(true);
+    expect(existsSync(resolve(home, '.claude/CLAUDE.md'))).toBe(false);
+    // bun's global copy, a project dependency and npx's cache.
+    const bun = place(resolve(home, '.bun/install/global/node_modules/buildlock/bin'));
+    expect(spawnSync(bun, ['update'], { env, encoding: 'utf8' }).stderr).toContain('bun add -g buildlock@latest');
+    const dependency = place(resolve(root, 'app/node_modules/buildlock/bin'));
+    expect(spawnSync(dependency, ['update'], { env, encoding: 'utf8' }).stderr).toContain(`a dependency of ${resolve(root, 'app')}`);
+    const npx = place(resolve(home, '.npm/_npx/0a1b2c/node_modules/buildlock/bin'));
+    expect(spawnSync(npx, ['update'], { env, encoding: 'utf8' }).stderr).toContain('npx buildlock@latest');
+    const kept = spawnSync(npx, ['uninstall', '--yes', '--keep-agents'], { env, encoding: 'utf8' });
+    expect(kept.status).toBe(0);
+    expect(kept.stdout).toContain('Nothing to remove');
+    expect(existsSync(npx)).toBe(true);
+});
+
+test('install.sh points a package manager copy back to it', () => {
+    const { env, root } = sandbox();
+    const pkg = resolve(root, 'lib/node_modules/buildlock/bin');
+    mkdirSync(pkg, { recursive: true });
+    copyFileSync(script, resolve(pkg, 'buildlock'));
+    mkdirSync(resolve(root, 'bin'), { recursive: true });
+    symlinkSync(resolve(pkg, 'buildlock'), resolve(root, 'bin/buildlock'));
+    const result = spawnSync('bash', [installer, '--from', script, '--prefix', resolve(root, 'bin'), '--yes'], { env, encoding: 'utf8' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('npm install -g buildlock@latest');
+});

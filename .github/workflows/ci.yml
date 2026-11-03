@@ -18,11 +18,13 @@ jobs:
                     persist-credentials: false
             -   uses: ./.github/actions/shellcheck
             -   run: shellcheck --version && shellcheck bin/buildlock install.sh scripts/release.sh
-            -   name: The version has a CHANGELOG section
+            -   name: The version has a CHANGELOG section and matches package.json
                 run: |
                     version="$(sed -n 's/^bl_version=//p' bin/buildlock)"
                     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "bad bl_version: $version"; exit 1; }
                     grep -qx "## $version" CHANGELOG.md || { echo "CHANGELOG.md has no '## $version' heading"; exit 1; }
+                    package="$(node -p 'require("./package.json").version')"
+                    test "$package" = "$version" || { echo "package.json says $package, bin/buildlock $version"; exit 1; }
 
     test:
         name: Tests (${{ matrix.os }})
@@ -67,3 +69,24 @@ jobs:
                     buildlock uninstall --yes --purge
                     test ! -e "$RUNNER_TEMP/bin/buildlock"
                     ! grep -qs BUILDLOCK_START ~/.claude/CLAUDE.md ~/.codex/AGENTS.md
+
+    npm:
+        name: npm package
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+            -   name: Pack, install globally, run
+                run: |
+                    set -euo pipefail
+                    tgz="$(npm pack --silent)"
+                    tar tzf "$tgz" | sort | tee files.txt
+                    grep -qx package/bin/buildlock files.txt
+                    ! grep -E '^package/(test|scripts|\.github)/|^package/install\.sh$' files.txt
+                    npm install -g --prefix "$RUNNER_TEMP/npm" "./$tgz"
+                    bl="$RUNNER_TEMP/npm/bin/buildlock"
+                    test "$("$bl" --version)" = "buildlock $(node -p 'require("./package.json").version')"
+                    test "$("$bl" bash -c 'echo ok')" = ok
+                    out="$("$bl" update 2>&1 || true)"
+                    grep -q 'npm install -g buildlock@latest' <<< "$out" || { echo "$out"; exit 1; }

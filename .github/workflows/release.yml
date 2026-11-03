@@ -24,6 +24,8 @@ jobs:
                     version="$(sed -n 's/^bl_version=//p' bin/buildlock)"
                     test "v$version" = "$GITHUB_REF_NAME" || { echo "bin/buildlock says $version, the tag is $GITHUB_REF_NAME"; exit 1; }
                     grep -qx "## $version" CHANGELOG.md || { echo "CHANGELOG.md has no '## $version' heading"; exit 1; }
+                    package="$(node -p 'require("./package.json").version')"
+                    test "$package" = "$version" || { echo "package.json says $package, the tag is $GITHUB_REF_NAME"; exit 1; }
             -   run: shellcheck bin/buildlock install.sh scripts/release.sh
             -   run: bun test
 
@@ -59,6 +61,49 @@ jobs:
                     prerelease=()
                     [[ "$GITHUB_REF_NAME" != *-* ]] || prerelease=(--prerelease)
                     gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "buildlock ${GITHUB_REF_NAME#v}" --notes-file notes.md "${prerelease[@]}"
+
+    npm:
+        name: Publish to npm
+        needs: publish
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            # Trusted publishing: npm trades this job's OIDC token for a one-time
+            # publish token and adds provenance. No npm token is stored anywhere.
+            id-token: write
+        steps:
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+            -   uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+                with:
+                    node-version: 24
+                    registry-url: https://registry.npmjs.org
+            -   name: Publish
+                run: |
+                    set -euo pipefail
+                    version="${GITHUB_REF_NAME#v}"
+                    test "$(node -p 'require("./package.json").version')" = "$version"
+                    # Trusted publishing needs npm 11.5.1 or newer.
+                    IFS=. read -r major minor patch <<< "$(npm --version)"
+                    (( major > 11 || (major == 11 && (minor > 5 || (minor == 5 && patch >= 1))) )) || npm install -g npm@^11.5.1
+                    if npm view "buildlock@$version" version > /dev/null 2>&1; then
+                        echo "buildlock@$version is already on npm"
+                        exit 0
+                    fi
+                    tag=latest
+                    [[ "$version" != *-* ]] || tag=next
+                    npm publish --tag "$tag"
+            -   name: Install it from npm, as users do
+                run: |
+                    set -euo pipefail
+                    version="${GITHUB_REF_NAME#v}"
+                    for attempt in 1 2 3 4 5 6; do
+                        npm install -g --prefix "$RUNNER_TEMP/npm" "buildlock@$version" && break
+                        sleep 10
+                    done
+                    test "$("$RUNNER_TEMP/npm/bin/buildlock" --version)" = "buildlock $version"
+                    test "$("$RUNNER_TEMP/npm/bin/buildlock" bash -c 'echo ok')" = ok
 
     smoke:
         name: Install the release
