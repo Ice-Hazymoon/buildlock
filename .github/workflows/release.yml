@@ -1,0 +1,35 @@
+name: Release
+
+on:
+    push:
+        tags: ['v*']
+
+permissions:
+    contents: write
+
+jobs:
+    release:
+        runs-on: ubuntu-latest
+        steps:
+            -   uses: actions/checkout@v4
+            -   uses: oven-sh/setup-bun@v2
+            -   name: Tag matches the script's version
+                run: |
+                    version="$(sed -n 's/^bl_version=//p' bin/buildlock)"
+                    test "v$version" = "$GITHUB_REF_NAME" || { echo "bin/buildlock says $version, tag is $GITHUB_REF_NAME"; exit 1; }
+            -   run: shellcheck bin/buildlock install.sh
+            -   run: bun test
+            -   name: Assets
+                run: |
+                    mkdir dist
+                    cp bin/buildlock install.sh dist/
+                    (cd dist && sha256sum buildlock > buildlock.sha256 && sha256sum install.sh > install.sh.sha256)
+            -   name: Release notes from CHANGELOG.md
+                run: |
+                    version="${GITHUB_REF_NAME#v}"
+                    awk -v v="## $version" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > notes.md
+                    test -s notes.md || echo "buildlock $version" > notes.md
+            -   name: Publish
+                env:
+                    GH_TOKEN: ${{ github.token }}
+                run: gh release create "$GITHUB_REF_NAME" dist/* --title "buildlock ${GITHUB_REF_NAME#v}" --notes-file notes.md

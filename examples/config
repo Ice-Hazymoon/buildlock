@@ -1,0 +1,38 @@
+# Example ~/.config/buildlock/config
+#
+# The file is bash, sourced on every buildlock call. Environment variables set
+# by the caller (BUILDLOCK_SLOTS=1 buildlock ...) win over everything here.
+# `buildlock config set/unset` only rewrites the lines between the markers.
+
+# >>> buildlock config >>>
+BUILDLOCK_SLOTS=3
+BUILDLOCK_MAX_JOBS=6
+BUILDLOCK_RESERVE_MEMORY_MB=4096
+BUILDLOCK_QUIET_HOURS=00:00-08:00
+BUILDLOCK_QUIET_SLOTS=1
+BUILDLOCK_QUIET_WORKERS=4
+BUILDLOCK_QUIET_LIGHT_SLOTS=2
+# <<< buildlock config <<<
+
+# Your own conditions go below the markers, so they run after (and win over) them.
+
+# Quiet mode whenever turbo boost is off, e.g. a "silent" power profile or a
+# night-time script that caps the CPU. `read` is a builtin: no extra process.
+if read -r boost < /sys/devices/system/cpu/cpufreq/boost 2>/dev/null && [[ $boost == 0 ]]; then
+    BUILDLOCK_QUIET=on
+fi
+
+# Running on battery: one heavy job at a time.
+if read -r online < /sys/class/power_supply/AC/online 2>/dev/null && [[ $online == 0 ]]; then
+    BUILDLOCK_SLOTS=1
+fi
+
+# CI runners have the machine to themselves: run without queueing.
+[[ -n "${CI:-}" ]] && BUILDLOCK_BYPASS=1
+
+# One project's tool runs many lanes of its own and must not queue; keep its
+# test workers low instead.
+if [[ "$PWD" == "$HOME/projects/big-monorepo"* && "${AI_AGENT:-}" == my-runner* ]]; then
+    BUILDLOCK_BYPASS=1
+    BUILDLOCK_WORKERS=4
+fi

@@ -1,0 +1,10 @@
+{
+    "name": "buildlock",
+    "private": true,
+    "description": "A machine-wide queue for heavy commands, so many terminals and coding agents can share one machine.",
+    "license": "MIT",
+    "scripts": {
+        "test": "bun test",
+        "lint": "shellcheck bin/buildlock install.sh"
+    }
+}

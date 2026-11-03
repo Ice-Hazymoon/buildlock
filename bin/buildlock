@@ -1,0 +1,3177 @@
+#!/usr/bin/env bash
+# buildlock: a machine-wide queue for heavy commands (full builds, type-checks,
+# test suites), so many terminals and coding agents can share one machine.
+# https://github.com/Ice-Hazymoon/buildlock · MIT License
+#
+# How admission works
+#
+# Waiters start in arrival order. The head of the queue starts at once when no
+# job is running; beside running jobs it starts only while the machine has room
+# for one more: a free slot (cores / BUILDLOCK_WORKERS), the minimum gap since
+# the last start (so that job's load shows first), CPU/IO pressure and load
+# under their ceilings, and enough memory after reserving what running jobs
+# still ramping up (started within BUILDLOCK_RAMP_SECONDS) may grow into, up to
+# each job's own budget. Even the only job waits while memory is critically
+# short.
+#
+# Job identity and learned profiles: a job's key is its repository (the
+# directory holding the shared .git, so all worktrees of a repo share it; $PWD
+# outside git), its command with file arguments normalized (normalize_cmd) and
+# any requested BUILDLOCK_CLASS. With >= 3 finished runs of that key among the
+# last 20 (current and previous month's job log), the budget becomes learned:
+# p90(peakMb) * 1.25 + 256, at least 512 MB. Measured beats a declared
+# BUILDLOCK_JOB_MEMORY_MB or the default unless BUILDLOCK_PROFILE=off. A
+# background sampler records the job tree's peak RSS every
+# BUILDLOCK_SAMPLE_SECONDS (default 2, first sample one interval in); it is
+# stopped when the job exits and never touches the job's exit code or output.
+#
+# Automatic light class: with BUILDLOCK_CLASS unset, a learned profile at most
+# BUILDLOCK_LIGHT_MAX_MB (default 2048) and BUILDLOCK_LIGHT_MAX_SECONDS
+# (default 180) joins the light lane on its own. `BUILDLOCK_CLASS=light` keeps
+# its meaning (heavy when its budget exceeds the light max); `heavy` forces
+# heavy.
+#
+# Idle fast path: expected_load = load1 + BUILDLOCK_WORKERS per heavy job and
+# BUILDLOCK_LIGHT_CPUS per light job started within BUILDLOCK_RAMP_CPU_SECONDS
+# (default 60). The machine is idle while expected_load < cores *
+# BUILDLOCK_IDLE_LOAD_RATIO (default 0.5), CPU "some" and IO "full" pressure
+# are at most BUILDLOCK_IDLE_CPU_PRESSURE / BUILDLOCK_IDLE_IO_PRESSURE
+# (default 10 each) and memory pressure is under its ceiling. While idle a job
+# skips the start gap and a lane may run past its slots up to
+# BUILDLOCK_MAX_JOBS (default cores / 4) or BUILDLOCK_LIGHT_MAX_JOBS (default
+# cores / 2); an explicit BUILDLOCK_SLOTS / BUILDLOCK_LIGHT_SLOTS pins that
+# lane's cap to its slot count. Memory checks always apply. A job that needed
+# this path is logged with "admission":"idle", else "free".
+#
+# `BUILDLOCK_CLASS=light` (small, quick jobs, budget <= BUILDLOCK_LIGHT_MAX_MB)
+# gets its own slot pool (BUILDLOCK_LIGHT_SLOTS) and skips the heavy FIFO head
+# and start gap, but still waits out the same load/pressure/memory ceilings and
+# its own slot cap; light jobs still count toward what heavy admission
+# reserves. A heavy call nested inside a light holder queues as heavy instead
+# of passing through, so heavy work never lands on a light slot.
+#
+# Every job that acquires a slot appends one JSON line to
+# `${BUILDLOCK_JOB_LOG_DIR:-~/.cache/buildlock}/jobs-YYYY-MM.jsonl` on exit
+# (start/end, class, budget, wait/run seconds, exit code, command, key,
+# peakMb, budgetSource, admission); logging failures are ignored and never
+# change the job's own exit code.
+#
+# Stable interfaces other tools parse: `--status` and `--explain` output, the
+# `buildlock: waited Ns` stderr line, the job-log line format, and the lock,
+# holder and queue file formats (old and new versions share them during an
+# upgrade). Replace the installed file by rename so running instances keep
+# reading the old one; `buildlock update` and install.sh do that.
+#
+# A job's resources are released only after its command process group exits.
+# Cancellation gives TERM about one second, then KILL and up to two seconds to
+# observe group exit; normal command exits also clean up same-group leftovers.
+set -euo pipefail
+shopt -s nullglob
+
+bl_version=0.1.0
+bl_repo=Ice-Hazymoon/buildlock
+bl_home="https://github.com/$bl_repo"
+
+# ---------------------------------------------------------------------------
+# Configuration: environment > quiet-hours overrides > config file > defaults.
+
+# Minutes since midnight for "HH" or "HH:MM" (24:00 allowed as an end), in REPLY.
+parse_hhmm() {
+    [[ "$1" =~ ^([0-9]{1,2})(:([0-9]{2}))?$ ]] || return 1
+    local h=$(( 10#${BASH_REMATCH[1]} )) m=$(( 10#${BASH_REMATCH[3]:-0} ))
+    (( h <= 24 && m < 60 && h * 60 + m <= 1440 )) || return 1
+    REPLY=$(( h * 60 + m ))
+}
+
+# Succeeds when minute $2 of the day falls in a range of $1 ("00:00-08:00",
+# several comma-separated). A range may wrap past midnight ("22-06").
+in_hours() {
+    local range start end ranges=()
+    IFS=',' read -r -a ranges <<< "${1// /}"
+    for range in "${ranges[@]}"; do
+        [[ "$range" == ?*-?* ]] || continue
+        parse_hhmm "${range%%-*}" || continue
+        start="$REPLY"
+        parse_hhmm "${range#*-}" || continue
+        end="$REPLY"
+        if (( start < end )); then
+            if (( $2 >= start && $2 < end )); then return 0; fi
+        elif (( start > end )); then
+            if (( $2 >= start || $2 < end )); then return 0; fi
+        fi
+    done
+    return 1
+}
+
+valid_hours() {
+    local range ranges=()
+    [[ -n "$1" ]] || return 1
+    IFS=',' read -r -a ranges <<< "${1// /}"
+    (( ${#ranges[@]} > 0 )) || return 1
+    for range in "${ranges[@]}"; do
+        [[ "$range" == ?*-?* ]] && parse_hhmm "${range%%-*}" && parse_hhmm "${range#*-}" || return 1
+    done
+}
+
+config_file="${BUILDLOCK_CONFIG-${XDG_CONFIG_HOME:-$HOME/.config}/buildlock/config}"
+declare -A env_values=() from_config=() from_quiet=()
+for _name in ${!BUILDLOCK_@}; do env_values[$_name]="${!_name}"; done
+if [[ -n "$config_file" && -r "$config_file" ]]; then
+    # Sourced (not parsed) so a config can branch on machine state. `|| true`
+    # keeps a failing line in it from aborting under errexit; nounset is off so
+    # a typo there cannot stop every build on the machine.
+    set +u
+    # shellcheck source=/dev/null
+    source "$config_file" || true
+    set -u
+    for _name in ${!BUILDLOCK_@}; do
+        [[ -n "${env_values[$_name]+set}" ]] || from_config[$_name]=1
+    done
+    # The caller's environment wins over anything the file assigned.
+    for _name in "${!env_values[@]}"; do printf -v "$_name" '%s' "${env_values[$_name]}"; done
+fi
+
+# Quiet mode: BUILDLOCK_QUIET=on/off forces it; otherwise BUILDLOCK_QUIET_HOURS
+# decides. While quiet, every BUILDLOCK_QUIET_<NAME> replaces BUILDLOCK_<NAME>
+# unless the caller's environment set that one explicitly.
+quiet_active=0
+quiet_reason=off
+case "${BUILDLOCK_QUIET:-auto}" in
+    1|on|yes|true) quiet_active=1; quiet_reason=forced ;;
+    0|off|no|false) quiet_reason=forced-off ;;
+    *)
+        if [[ -n "${BUILDLOCK_QUIET_HOURS:-}" ]]; then
+            printf -v _now '%(%H:%M)T' -1
+            parse_hhmm "$_now"
+            quiet_reason=outside-hours
+            if in_hours "$BUILDLOCK_QUIET_HOURS" "$REPLY"; then quiet_active=1; quiet_reason=hours; fi
+        fi
+        ;;
+esac
+if (( quiet_active == 1 )); then
+    for _name in ${!BUILDLOCK_QUIET_@}; do
+        [[ "$_name" != BUILDLOCK_QUIET_HOURS ]] || continue
+        _knob="BUILDLOCK_${_name#BUILDLOCK_QUIET_}"
+        [[ -z "${env_values[$_knob]+set}" ]] || continue
+        printf -v "$_knob" '%s' "${!_name}"
+        from_quiet[$_knob]=1
+    done
+    # A quiet slot count also caps the idle fast path, unless QUIET_*MAX_JOBS
+    # says otherwise: a normal MAX_JOBS must not let an idle night run 8 jobs.
+    for _lane in '' LIGHT_; do
+        _knob="BUILDLOCK_${_lane}MAX_JOBS"
+        if [[ -n "${from_quiet[BUILDLOCK_${_lane}SLOTS]+set}" && -z "${from_quiet[$_knob]+set}" && -z "${env_values[$_knob]+set}" ]]; then
+            unset "$_knob"
+        fi
+    done
+fi
+unset _name _knob _now _lane
+
+# A number the scheduler cannot use (a typo in the config, "09", "abc", 0
+# slots) falls back to its default with a warning instead of breaking every
+# build on the machine. Kinds: n = whole number >= 1, z = whole number >= 0,
+# f = decimal number.
+for _spec in WORKERS:n CORES:n SLOTS:n MAX_JOBS:n LIGHT_SLOTS:n LIGHT_MAX_JOBS:n LIGHT_CPUS:z START_GAP:z \
+    RAMP_SECONDS:z RAMP_CPU_SECONDS:z RESERVE_MEMORY_MB:z CRITICAL_MEMORY_MB:z DEFAULT_MEMORY_MB:n \
+    DEFAULT_LIGHT_MEMORY_MB:n LIGHT_MAX_MB:z LIGHT_MAX_SECONDS:z JOB_MEMORY_MB:n LOAD_MAX:f CPU_PRESSURE_MAX:f \
+    IO_PRESSURE_MAX:f MEMORY_PRESSURE_MAX:f CRITICAL_MEMORY_PRESSURE:f IDLE_LOAD_RATIO:f IDLE_CPU_PRESSURE:f \
+    IDLE_IO_PRESSURE:f SAMPLE_SECONDS:f; do
+    _name="BUILDLOCK_${_spec%:*}"
+    [[ -n "${!_name+set}" ]] || continue
+    case "${_spec#*:}" in
+        n) [[ "${!_name}" =~ ^[1-9][0-9]*$ ]] && continue ;;
+        z) [[ "${!_name}" =~ ^(0|[1-9][0-9]*)$ ]] && continue ;;
+        f) [[ "${!_name}" =~ ^[0-9]+([.][0-9]+)?$ ]] && continue ;;
+    esac
+    printf 'buildlock: ignoring %s=%q (%s); using the default\n' "$_name" "${!_name}" \
+        "$(case "${_spec#*:}" in n) printf 'needs a whole number of at least 1' ;; z) printf 'needs a whole number' ;; *) printf 'needs a number' ;; esac)" >&2
+    unset "$_name"
+done
+unset _spec _name
+
+# Commands run unqueued (CI runners or containers with their own limits, or a
+# condition in the config file); worker limits are still exported.
+bypass=0
+case "${BUILDLOCK_BYPASS:-}" in 1|on|yes|true) bypass=1 ;; esac
+
+: "${BUILDLOCK_WORKERS:=8}"
+export BUILDLOCK_WORKERS
+export VITEST_MAX_WORKERS="${VITEST_MAX_WORKERS:-$BUILDLOCK_WORKERS}"
+export VITEST_MAX_FORKS="${VITEST_MAX_FORKS:-$BUILDLOCK_WORKERS}"
+export VITEST_MAX_THREADS="${VITEST_MAX_THREADS:-$BUILDLOCK_WORKERS}"
+export JEST_MAX_WORKERS="${JEST_MAX_WORKERS:-$BUILDLOCK_WORKERS}"
+
+lock_path="${BUILDLOCK_LOCK_PATH:-$HOME/.cache/buildlock.lock}"
+queue_dir="${lock_path}.queue"
+sched_path="${lock_path}.sched"
+started_file="${lock_path}.started"
+proc_root="${BUILDLOCK_PROC_ROOT:-/proc}"
+job_log_dir="${BUILDLOCK_JOB_LOG_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/buildlock}"
+self_pid="$BASHPID"
+
+cores="${BUILDLOCK_CORES:-$(nproc)}"
+slots="${BUILDLOCK_SLOTS:-$(( cores / BUILDLOCK_WORKERS > 1 ? cores / BUILDLOCK_WORKERS : 1 ))}"
+start_gap="${BUILDLOCK_START_GAP:-20}"
+load_max="${BUILDLOCK_LOAD_MAX:-$(( cores * 5 / 4 ))}"
+cpu_pressure_max="${BUILDLOCK_CPU_PRESSURE_MAX:-25}"
+io_pressure_max="${BUILDLOCK_IO_PRESSURE_MAX:-40}"
+memory_pressure_max="${BUILDLOCK_MEMORY_PRESSURE_MAX:-5}"
+ramp_seconds="${BUILDLOCK_RAMP_SECONDS:-240}"
+reserve_memory_mb="${BUILDLOCK_RESERVE_MEMORY_MB:-6144}"
+critical_memory_mb="${BUILDLOCK_CRITICAL_MEMORY_MB:-3072}"
+critical_memory_pressure="${BUILDLOCK_CRITICAL_MEMORY_PRESSURE:-30}"
+
+# Light lane: its own slot pool and memory ceiling. A light request whose own
+# budget exceeds BUILDLOCK_LIGHT_MAX_MB is treated as heavy.
+light_slots="${BUILDLOCK_LIGHT_SLOTS:-$(( cores / 4 > 1 ? cores / 4 : 1 ))}"
+light_max_mb="${BUILDLOCK_LIGHT_MAX_MB:-2048}"
+light_max_seconds="${BUILDLOCK_LIGHT_MAX_SECONDS:-180}"
+light_cpus="${BUILDLOCK_LIGHT_CPUS:-2}"
+default_heavy_mb="${BUILDLOCK_DEFAULT_MEMORY_MB:-8192}"
+default_light_mb="${BUILDLOCK_DEFAULT_LIGHT_MEMORY_MB:-1536}"
+profile_mode="${BUILDLOCK_PROFILE:-on}"
+
+# Idle fast path knobs.
+sample_seconds="${BUILDLOCK_SAMPLE_SECONDS:-2}"
+ramp_cpu_seconds="${BUILDLOCK_RAMP_CPU_SECONDS:-60}"
+idle_load_ratio="${BUILDLOCK_IDLE_LOAD_RATIO:-0.5}"
+idle_cpu_pressure="${BUILDLOCK_IDLE_CPU_PRESSURE:-10}"
+idle_io_pressure="${BUILDLOCK_IDLE_IO_PRESSURE:-10}"
+# An explicit BUILDLOCK_SLOTS / BUILDLOCK_LIGHT_SLOTS pins that lane's
+# concurrency: its idle cap then defaults to the slot count itself.
+if [[ -n "${BUILDLOCK_SLOTS:-}" ]]; then default_max_jobs="$slots"; else default_max_jobs=$(( cores / 4 > 0 ? cores / 4 : 1 )); fi
+if [[ -n "${BUILDLOCK_LIGHT_SLOTS:-}" ]]; then default_light_max_jobs="$light_slots"; else default_light_max_jobs=$(( cores / 2 > 0 ? cores / 2 : 1 )); fi
+max_jobs="${BUILDLOCK_MAX_JOBS:-$default_max_jobs}"
+(( max_jobs >= slots )) || max_jobs="$slots"
+light_max_jobs="${BUILDLOCK_LIGHT_MAX_JOBS:-$default_light_max_jobs}"
+(( light_max_jobs >= light_slots )) || light_max_jobs="$light_slots"
+
+# ---------------------------------------------------------------------------
+# Scheduler core.
+
+# Slot 0 keeps the historical lock and holder paths, so callers still running
+# the previous single-lock script share it rather than run beside the scheduler.
+# A light job's slots live at their own `.lightN` path. Both lanes' slot
+# numbering extends past their normal count up to the hard cap
+# (BUILDLOCK_MAX_JOBS / BUILDLOCK_LIGHT_MAX_JOBS) for the idle fast path.
+slot_lock() {
+    if [[ "${2:-heavy}" == light ]]; then
+        printf '%s.light%s' "$lock_path" "$1"
+    elif (( $1 == 0 )); then
+        printf '%s' "$lock_path"
+    else
+        printf '%s.slot%s' "$lock_path" "$1"
+    fi
+}
+slot_holder() {
+    if [[ "${2:-heavy}" == light ]]; then
+        printf '%s.light%s.holder' "$lock_path" "$1"
+    elif (( $1 == 0 )); then
+        printf '%s.holder' "$lock_path"
+    else
+        printf '%s.slot%s.holder' "$lock_path" "$1"
+    fi
+}
+
+# Escapes backslash, double quote and control characters for a JSON string,
+# without depending on python or jq.
+json_escape() {
+    local s="$1" out='' i c code len
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\n'/\\n}"
+    len="${#s}"
+    for (( i = 0; i < len; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" < $'\x20' ]]; then
+            printf -v code '%d' "'$c"
+            printf -v c '\\u%04x' "$code"
+        fi
+        out+="$c"
+    done
+    printf '%s' "$out"
+}
+
+# A recorded pid still names a buildlock process (not a dead or reused pid).
+is_buildlock_pid() {
+    local args=()
+    [[ "$1" =~ ^[0-9]+$ ]] || return 1
+    mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || return 1
+    [[ "${args[*]}" == *buildlock* ]]
+}
+
+is_ancestor() {
+    local target="$1" current="$PPID"
+    while [[ "$current" =~ ^[0-9]+$ && "$current" -gt 1 ]]; do
+        [[ "$current" == "$target" ]] && return 0
+        [[ -r "/proc/$current/status" ]] || return 1
+        current="$(awk '/^PPid:/ { print $2; exit }' "/proc/$current/status")"
+    done
+    return 1
+}
+
+# The repository identity a job's history is grouped under: the directory
+# containing the shared .git (so every worktree of one repo shares learned
+# profiles), or $PWD when this isn't a git checkout.
+repo_root() {
+    # Pure bash (no git process): this runs before every job queues.
+    local dir="$PWD" gitdir=''
+    while :; do
+        if [[ -d "$dir/.git" ]]; then
+            printf '%s' "$dir"; return
+        fi
+        if [[ -f "$dir/.git" ]]; then
+            read -r gitdir < "$dir/.git" || true
+            gitdir="${gitdir#gitdir: }"
+            [[ "$gitdir" == /* ]] || gitdir="$dir/$gitdir"
+            # A linked worktree's gitdir is <common>/worktrees/<name>.
+            if [[ "$gitdir" == */worktrees/* ]]; then
+                gitdir="${gitdir%/worktrees/*}"
+                printf '%s' "${gitdir%/*}"
+            else
+                printf '%s' "$dir"
+            fi
+            return
+        fi
+        [[ "$dir" != / && -n "$dir" ]] || break
+        dir="${dir%/*}"
+        [[ -n "$dir" ]] || dir=/
+    done
+    printf '%s' "$PWD"
+}
+
+# Normalizes a command into a profile key component. A `sh -c` / `bash -lc`
+# string is split into words first. The executable, a `cd` target and a script
+# run by an interpreter (bun, node, python, ...) keep their base names; flags
+# stay verbatim; every other path-like argument (containing '/', or ending in
+# a source extension) becomes `<p>`, consecutive ones collapsing to one;
+# truncated to 160 chars. Runs that differ only in which files they name share
+# a key; a whole-suite run with no path arguments, or another script, does not.
+normalize_cmd() {
+    local args=("$@") out='' arg word last_was_path=0 prev=''
+    if (( ${#args[@]} >= 3 )) && [[ "${args[0]##*/}" =~ ^(ba|z|da)?sh$ && "${args[1]}" =~ ^-[a-z]*c[a-z]*$ ]]; then
+        read -r -a args <<< "${args[2]//$'\n'/ }"
+    fi
+    for arg in "${args[@]}"; do
+        if [[ -z "$out" ]]; then
+            word="${arg##*/}"
+        elif [[ "$arg" == -* ]]; then
+            word="$arg"
+        elif [[ "$prev" == cd || ( "$prev" =~ ^(bun|node|tsx|deno|python3?|bash|sh|zsh)$ && "$arg" =~ \.(ts|mts|js|mjs|cjs|py|sh)$ ) ]]; then
+            word="${arg##*/}"
+        elif [[ "$arg" == */* || "$arg" =~ \.(ts|tsx|vue|js|mjs|json|md|yml|yaml|sh)$ ]]; then
+            (( last_was_path == 1 )) || out+=" <p>"
+            last_was_path=1
+            prev="$arg"
+            continue
+        else
+            word="$arg"
+        fi
+        out+="${out:+ }$word"
+        last_was_path=0
+        prev="${word}"
+    done
+    printf '%s' "${out:0:160}"
+}
+
+# Resident KiB of each given process tree, one line per root pid.
+tree_rss_kb() {
+    [[ -n "$1" ]] || return 0
+    ps -e -o pid=,ppid=,rss= | awk -v roots="$1" '
+        { parent[$1] = $2; rss[$1] = $3 }
+        END {
+            n = split(roots, list, " ")
+            for (pid in parent) {
+                depth = 0
+                for (p = pid; p != "" && p > 1 && depth < 256; p = parent[p]) {
+                    for (i = 1; i <= n; i++) if (p == list[i]) total[i] += rss[pid]
+                    depth++
+                }
+            }
+            for (i = 1; i <= n; i++) print total[i] + 0
+        }'
+}
+
+exceeds() { awk -v value="$1" -v max="$2" 'BEGIN { exit !(value + 0 > max + 0) }'; }
+
+# Looks up up to the last 20 finished job-log lines (current + previous month)
+# sharing $1's key. Sets profile_count (samples found, capped at 20) and,
+# with >= 3 samples, est_mb (p90(peakMb) * 1.25 + 256, min 512) and est_run
+# (p90(runSeconds)); otherwise leaves them empty so callers fall back to an
+# explicit or default budget.
+profile_lookup() {
+    local key="$1" cur_month prev_month year month files=() file out
+    est_mb=''
+    est_run=''
+    profile_count=0
+    [[ -d "$job_log_dir" ]] || return 0
+    # Builtins and one awk: this runs before every job queues.
+    TZ=UTC printf -v cur_month '%(%Y-%m)T' -1
+    year="${cur_month%-*}"
+    month=$(( 10#${cur_month#*-} - 1 ))
+    (( month > 0 )) || { month=12; year=$(( year - 1 )); }
+    printf -v prev_month '%04d-%02d' "$year" "$month"
+    for file in "$job_log_dir/jobs-$prev_month.jsonl" "$job_log_dir/jobs-$cur_month.jsonl"; do
+        [[ -r "$file" ]] && files+=("$file")
+    done
+    (( ${#files[@]} > 0 )) || return 0
+    out="$(awk -v needle="\"key\":\"$(json_escape "$key")\"" '
+        index($0, needle) { lines[++n] = $0 }
+        END {
+            for (l = (n > 20 ? n - 19 : 1); l <= n; l++) {
+                if (match(lines[l], /"peakMb":[0-9]+/)) mv[++mn] = substr(lines[l], RSTART + 9, RLENGTH - 9) + 0
+                if (match(lines[l], /"runSeconds":[0-9]+/)) rv[++rn] = substr(lines[l], RSTART + 13, RLENGTH - 13) + 0
+            }
+            for (i = 2; i <= mn; i++) { k = mv[i]; j = i - 1; while (j >= 1 && mv[j] > k) { mv[j+1] = mv[j]; j-- }; mv[j+1] = k }
+            for (i = 2; i <= rn; i++) { k = rv[i]; j = i - 1; while (j >= 1 && rv[j] > k) { rv[j+1] = rv[j]; j-- }; rv[j+1] = k }
+            mi = int(0.9 * mn); if (0.9 * mn > mi) mi++; if (mi < 1) mi = 1
+            ri = int(0.9 * rn); if (0.9 * rn > ri) ri++; if (ri < 1) ri = 1
+            est = (mn > 0 ? mv[mi] : 0) * 1.25 + 256; if (est < 512) est = 512
+            printf "%d %d %d\n", mn, est, (rn > 0 ? rv[ri] : 0)
+        }' "${files[@]}" 2>/dev/null)" || return 0
+    read -r profile_count est_mb est_run <<< "$out"
+    [[ "$profile_count" =~ ^[0-9]+$ ]] || profile_count=0
+    if (( profile_count < 3 )); then
+        est_mb=''
+        est_run=''
+    fi
+}
+
+# Running jobs, one "slot<TAB>pid<TAB>started<TAB>cwd<TAB>memory_mb<TAB>class"
+# line each (memory_mb is empty for jobs started by the previous single-lock
+# script; class defaults to heavy when the holder file predates the light
+# lane, which is every heavy holder file — only light ones write it).
+live_holders() {
+    local file slot pid started cwd memory class
+    for file in "$lock_path.holder" "$lock_path".slot*.holder "$lock_path".light*.holder; do
+        pid=''
+        memory=''
+        class=''
+        IFS=$'\t' read -r pid started cwd memory class 2>/dev/null < "$file" || true
+        is_buildlock_pid "$pid" || continue
+        if [[ "$file" == "$lock_path.holder" ]]; then
+            slot=0
+        elif [[ "$file" == "$lock_path".light*.holder ]]; then
+            slot="${file#"$lock_path".light}"
+            slot="light${slot%.holder}"
+        else
+            slot="${file#"$lock_path".slot}"
+            slot="${slot%.holder}"
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$slot" "$pid" "$started" "$cwd" "$memory" "${class:-heavy}"
+    done
+}
+
+# The class of the live holder with this pid, or nothing when it is not one.
+holder_class_for_pid() {
+    local target="$1" slot pid started cwd memory class
+    while IFS=$'\t' read -r slot pid started cwd memory class; do
+        [[ "$pid" == "$target" ]] && { printf '%s' "$class"; return 0; }
+    done <<< "$(live_holders)"
+    return 1
+}
+
+# Sets head_pid to the oldest live heavy waiter, light_head_pid to the oldest
+# live light waiter (its own arrival-order queue, independent of the heavy
+# head), legacy_waiting to 1 when a waiter of the previous script (which only
+# takes slot 0, always heavy) is queued, and queue_ahead to the waiters of this
+# job's lane that arrived before it (only once my_queue_key is set).
+# Builtins only: every waiter runs this about once a second.
+scan_queue() {
+    local file pid fields key lane best_key='' light_best_key=''
+    head_pid=''
+    light_head_pid=''
+    legacy_waiting=0
+    queue_ahead=0
+    for file in "$queue_dir"/*; do
+        pid="${file##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        if ! is_buildlock_pid "$pid"; then
+            rm -f "$file"
+            continue
+        fi
+        fields=()
+        IFS=$'\t' read -r -a fields 2>/dev/null < "$file" || true
+        if [[ "${fields[3]:-}" != scheduled ]]; then
+            legacy_waiting=1
+            continue
+        fi
+        key="${fields[4]:-0}"
+        [[ "$key" =~ ^[0-9]+$ ]] || key=0
+        lane="${fields[5]:-heavy}"
+        [[ "$lane" == light ]] || lane=heavy
+        if [[ -n "${my_queue_key:-}" && "$lane" == "${job_class:-heavy}" && "$pid" != "$self_pid" ]] \
+            && (( key < my_queue_key || (key == my_queue_key && pid < self_pid) )); then
+            queue_ahead=$(( queue_ahead + 1 ))
+        fi
+        if [[ "$lane" == light ]]; then
+            if [[ -z "$light_best_key" ]] || (( key < light_best_key || (key == light_best_key && pid < light_head_pid) )); then
+                light_best_key="$key"
+                light_head_pid="$pid"
+            fi
+            continue
+        fi
+        if [[ -z "$best_key" ]] || (( key < best_key || (key == best_key && pid < head_pid) )); then
+            best_key="$key"
+            head_pid="$pid"
+        fi
+    done
+}
+
+# Common /proc snapshot: "load1 avail_mb swap_total_mb swap_free_mb cpu io
+# mem_some mem_full" (cpu is CPU "some" avg10, io is IO "full" avg10).
+proc_metrics() {
+    local files=() name
+    for name in loadavg meminfo pressure/cpu pressure/io pressure/memory; do
+        [[ -r "$proc_root/$name" ]] && files+=("$proc_root/$name")
+    done
+    awk '
+        FILENAME ~ /loadavg$/ { load1 = $1 }
+        FILENAME ~ /meminfo$/ { m[$1] = $2 }
+        FILENAME ~ /pressure\/cpu$/ && $1 == "some" { split($2, a, "="); cpu = a[2] }
+        FILENAME ~ /pressure\/io$/ && $1 == "full" { split($2, a, "="); io = a[2] }
+        FILENAME ~ /pressure\/memory$/ { split($2, a, "="); mem[$1] = a[2] }
+        END {
+            printf "%s %d %d %d %s %s %s %s\n", load1 + 0, m["MemAvailable:"] / 1024, m["SwapTotal:"] / 1024,
+                m["SwapFree:"] / 1024, cpu + 0, io + 0, mem["some"] + 0, mem["full"] + 0
+        }' "${files[@]}" /dev/null
+}
+
+# Sets idle (0/1) and expected_load from $1 (live_holders() text): load1 plus
+# BUILDLOCK_WORKERS (heavy) / BUILDLOCK_LIGHT_CPUS (light) for every running
+# job still inside its ramp-up window (BUILDLOCK_RAMP_CPU_SECONDS). Idle
+# requires that expected load, CPU and IO pressure and memory pressure all
+# under their idle ceilings, and available memory above the critical floor.
+idle_check() {
+    local holders="$1" metrics load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full
+    local slot pid started cwd memory class extra=0
+    metrics="$(proc_metrics)"
+    read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
+    while IFS=$'\t' read -r slot pid started cwd memory class; do
+        [[ -n "$pid" ]] || continue
+        [[ "$started" =~ ^[0-9]+$ ]] || continue
+        if (( EPOCHSECONDS - started < ramp_cpu_seconds )); then
+            if [[ "$class" == light ]]; then
+                extra=$(( extra + light_cpus ))
+            else
+                extra=$(( extra + BUILDLOCK_WORKERS ))
+            fi
+        fi
+    done <<< "$holders"
+    # One awk for every comparison: this runs on each admission attempt.
+    read -r idle expected_load < <(awk -v l="$load1" -v e="$extra" -v c="$cores" -v r="$idle_load_ratio" \
+        -v cpu="$cpu" -v cpu_max="$idle_cpu_pressure" -v io="$io" -v io_max="$idle_io_pressure" \
+        -v mem="$mem_some" -v mem_max="$memory_pressure_max" 'BEGIN {
+            el = l + e
+            ok = el < c * r && cpu + 0 <= cpu_max + 0 && io + 0 <= io_max + 0 && mem + 0 <= mem_max + 0
+            printf "%d %.2f\n", ok, el
+        }')
+    if (( avail_mb > 0 && avail_mb < critical_memory_mb )); then idle=0; fi
+}
+
+# Prints why a queue head must wait, or nothing when it may start.
+# $1 = total running job count across both lanes (pressure/load/gap checks
+# only apply once something is running at all), $2 = "pid:started:memory_mb"
+# per running job in either lane (light jobs count toward what this admission
+# reserves), $3 = slot limit for this lane's busy check (default the heavy
+# slots), $4 = 1 to skip the heavy start-gap check (the light lane has none of
+# its own), $5 = this lane's own running count for the busy check (default $1,
+# i.e. the heavy lane when there is only one), $6 = this lane's hard cap (used
+# in place of $3 when idle), $7 = 1 when the machine is idle (see idle_check).
+wait_reason() {
+    local running="$1" jobs="$2" slot_limit="${3:-$slots}" skip_gap="${4:-0}" lane_running="${5:-$1}"
+    local hard_cap="${6:-$slot_limit}" idle_flag="${7:-0}" effective_limit
+    local metrics last=0 rss growth_kb=0 spare_mb
+    local job pid started budget ramping_pids='' ramping_budgets=()
+    local load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full
+    metrics="$(proc_metrics)"
+    read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
+
+    if (( avail_mb > 0 && avail_mb < critical_memory_mb )); then
+        printf 'memory critical: %sMB available < %sMB' "$avail_mb" "$critical_memory_mb"; return
+    fi
+    if exceeds "$mem_full" "$critical_memory_pressure"; then
+        printf 'memory stalling: full pressure %s%% > %s%%' "$mem_full" "$critical_memory_pressure"; return
+    fi
+    (( running > 0 )) || return 0
+
+    effective_limit="$slot_limit"
+    (( idle_flag == 0 )) || effective_limit="$hard_cap"
+    if (( lane_running >= effective_limit )); then
+        printf 'all %s slots busy' "$effective_limit"; return
+    fi
+    if (( skip_gap == 0 && idle_flag == 0 )); then
+        read -r last 2>/dev/null < "$started_file" || true
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        if (( EPOCHSECONDS - last < start_gap )); then
+            printf 'last start %ss ago < %ss gap' "$(( EPOCHSECONDS - last ))" "$start_gap"; return
+        fi
+    fi
+    if ! exceeds "$load_max" "$load1"; then
+        printf 'load %s >= %s' "$load1" "$load_max"; return
+    fi
+    if exceeds "$cpu" "$cpu_pressure_max"; then
+        printf 'cpu pressure %s%% > %s%%' "$cpu" "$cpu_pressure_max"; return
+    fi
+    if exceeds "$io" "$io_pressure_max"; then
+        printf 'io pressure %s%% > %s%%' "$io" "$io_pressure_max"; return
+    fi
+    if exceeds "$mem_some" "$memory_pressure_max"; then
+        printf 'memory pressure %s%% > %s%%' "$mem_some" "$memory_pressure_max"; return
+    fi
+    if (( swap_total_mb > 0 && swap_free_mb * 10 < swap_total_mb )); then
+        printf 'swap %sMB free of %sMB' "$swap_free_mb" "$swap_total_mb"; return
+    fi
+    if (( avail_mb > 0 )); then
+        # Only jobs still ramping up can grow; older ones sit at their working set.
+        for job in $jobs; do
+            IFS=: read -r pid started budget <<< "$job"
+            [[ "$started" =~ ^[0-9]+$ ]] && (( EPOCHSECONDS - started < ramp_seconds )) || continue
+            [[ "$budget" =~ ^[0-9]+$ ]] || budget="$job_memory_mb"
+            ramping_pids+="${ramping_pids:+ }$pid"
+            ramping_budgets+=("$budget")
+        done
+        local i=0
+        while read -r rss; do
+            [[ "$rss" =~ ^[0-9]+$ ]] || continue
+            budget="${ramping_budgets[i]}"
+            i=$(( i + 1 ))
+            (( rss >= budget * 1024 )) || growth_kb=$(( growth_kb + budget * 1024 - rss ))
+        done < <(tree_rss_kb "$ramping_pids")
+        spare_mb=$(( avail_mb - growth_kb / 1024 - job_memory_mb ))
+        if (( spare_mb < reserve_memory_mb )); then
+            printf 'memory: %sMB available - %sMB growth of ramping jobs - %sMB for this one < %sMB reserve' \
+                "$avail_mb" "$(( growth_kb / 1024 ))" "$job_memory_mb" "$reserve_memory_mb"; return
+        fi
+    fi
+}
+
+# Prints "<heavy running count> <light running count> <pid>:<started>:<memory_mb>..."
+# (the job list spans both lanes; heavy admission reserves light jobs' memory too).
+running_summary() {
+    local holders heavy_count=0 light_count=0 jobs='' slot pid started _cwd memory class
+    holders="$(live_holders)"
+    while IFS=$'\t' read -r slot pid started _cwd memory class; do
+        [[ -n "$pid" ]] || continue
+        if [[ "$class" == light ]]; then
+            light_count=$(( light_count + 1 ))
+        else
+            heavy_count=$(( heavy_count + 1 ))
+        fi
+        jobs+="${jobs:+ }$pid:$started:$memory"
+    done <<< "$holders"
+    printf '%s %s %s' "$heavy_count" "$light_count" "$jobs"
+}
+
+# Live queue entries in arrival order, "key<TAB>pid<TAB>queued_at<TAB>cwd<TAB>class".
+queue_entries() {
+    local file pid fields
+    for file in "$queue_dir"/*; do
+        pid="${file##*/}"
+        is_buildlock_pid "$pid" || continue
+        fields=()
+        IFS=$'\t' read -r -a fields 2>/dev/null < "$file" || continue
+        printf '%s\t%s\t%s\t%s\t%s\n' "${fields[4]:-${fields[1]:-0}000000}" "$pid" \
+            "${fields[1]:-$EPOCHSECONDS}" "${fields[2]:-}" "${fields[5]:-heavy}"
+    done | sort -n
+}
+
+# `--status`: the stable, line-oriented format scripts and tests parse.
+status() {
+    local holders slot pid started cwd class summary heavy_count light_count jobs reason idle_text key queued_at
+    holders="$(live_holders)"
+    if [[ -z "$holders" ]]; then
+        printf 'holder none\n'
+    else
+        while IFS=$'\t' read -r slot pid started cwd _memory class; do
+            printf 'holder pid=%s age=%ss worktree=%s slot=%s class=%s\n' "$pid" "$(( EPOCHSECONDS - started ))" "$cwd" "$slot" "${class:-heavy}"
+        done <<< "$holders"
+    fi
+    while IFS=$'\t' read -r key pid queued_at cwd class; do
+        [[ -n "$pid" ]] || continue
+        printf 'queued pid=%s age=%ss worktree=%s class=%s\n' "$pid" "$(( EPOCHSECONDS - queued_at ))" "$cwd" "$class"
+    done <<< "$(queue_entries)"
+    summary="$(running_summary)"
+    read -r heavy_count light_count jobs <<< "$summary"
+    idle_check "$holders"
+    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    idle_text=no
+    [[ "$idle" != 1 ]] || idle_text=yes
+    printf 'scheduler running=%s/%s next=%s light=%s/%s idle=%s expected_load=%s max=%s light_max=%s\n' \
+        "$heavy_count" "$slots" "${reason:-start}" "$light_count" "$light_slots" "$idle_text" "$expected_load" "$max_jobs" "$light_max_jobs"
+}
+
+# Sets job_key, profile_count, est_mb, est_run, job_class, job_memory_mb and
+# budget_source for the command in "$@". With no command (status) only the
+# class/budget part runs, so job_memory_mb is ready for wait_reason.
+resolve_job() {
+    local learned_mb=''
+    job_key=''
+    profile_count=0
+    est_mb=''
+    est_run=''
+    budget_source=default
+    if (( $# > 0 )); then
+        # A requested class is part of the identity: one script run on a small
+        # scope (light) and on the whole repository (heavy) learns separately.
+        job_key="$(repo_root)::$(normalize_cmd "$@")${BUILDLOCK_CLASS:+::$BUILDLOCK_CLASS}"
+        if [[ "$profile_mode" != off ]]; then
+            profile_lookup "$job_key"
+        fi
+    fi
+    if [[ -n "$est_mb" && "$profile_count" -ge 3 ]]; then
+        learned_mb="$est_mb"
+    fi
+    case "${BUILDLOCK_CLASS:-}" in
+        heavy)
+            job_class=heavy
+            if [[ -n "$learned_mb" ]]; then
+                job_memory_mb="$learned_mb"; budget_source=learned
+            elif [[ -n "${BUILDLOCK_JOB_MEMORY_MB:-}" ]]; then
+                job_memory_mb="$BUILDLOCK_JOB_MEMORY_MB"; budget_source=explicit
+            else
+                job_memory_mb="$default_heavy_mb"; budget_source=default
+            fi
+            ;;
+        light)
+            if [[ -n "$learned_mb" ]]; then
+                job_memory_mb="$learned_mb"; budget_source=learned
+            elif [[ -n "${BUILDLOCK_JOB_MEMORY_MB:-}" ]]; then
+                job_memory_mb="$BUILDLOCK_JOB_MEMORY_MB"; budget_source=explicit
+            else
+                job_memory_mb="$default_light_mb"; budget_source=default
+            fi
+            job_class=heavy
+            (( job_memory_mb > light_max_mb )) || job_class=light
+            ;;
+        *)
+            if [[ -n "$learned_mb" ]]; then
+                job_memory_mb="$learned_mb"; budget_source=learned
+                job_class=heavy
+                if (( learned_mb <= light_max_mb )) && [[ -n "$est_run" ]] && (( est_run <= light_max_seconds )); then
+                    job_class=light
+                fi
+            elif [[ -n "${BUILDLOCK_JOB_MEMORY_MB:-}" ]]; then
+                job_class=heavy
+                job_memory_mb="$BUILDLOCK_JOB_MEMORY_MB"; budget_source=explicit
+            else
+                job_class=heavy
+                job_memory_mb="$default_heavy_mb"; budget_source=default
+            fi
+            ;;
+    esac
+}
+
+# `--explain`: the stable format; the human view is the same lines.
+cmd_explain() {
+    local summary heavy_count light_count jobs verdict
+    summary="$(running_summary)"
+    read -r heavy_count light_count jobs <<< "$summary"
+    idle_check "$(live_holders)"
+    if [[ "$job_class" == light ]]; then
+        verdict="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+    else
+        verdict="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    fi
+    printf 'key: %s\n' "$job_key"
+    printf 'samples: %s\n' "$profile_count"
+    if [[ -n "$est_mb" ]]; then
+        printf 'profile: est_mb=%s est_run=%s\n' "$est_mb" "${est_run:-0}"
+    else
+        printf 'profile: no profile\n'
+    fi
+    printf 'class: %s budget=%sMB source=%s\n' "$job_class" "$job_memory_mb" "$budget_source"
+    printf 'verdict: %s\n' "${verdict:-start}"
+}
+
+# ---------------------------------------------------------------------------
+# Terminal output helpers.
+
+setup_ui() {
+    local want=0 locale="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+    if [[ -n "${FORCE_COLOR:-}" && "${FORCE_COLOR}" != 0 ]]; then
+        want=1
+    elif [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != dumb ]]; then
+        want=1
+    fi
+    if (( want == 1 )); then
+        c_bold=$'\e[1m' c_dim=$'\e[2m' c_red=$'\e[31m' c_green=$'\e[32m' c_yellow=$'\e[33m' c_cyan=$'\e[36m' c_reset=$'\e[0m'
+    else
+        c_bold='' c_dim='' c_red='' c_green='' c_yellow='' c_cyan='' c_reset=''
+    fi
+    if [[ "$locale" == *[Uu][Tt][Ff]-8* || "$locale" == *[Uu][Tt][Ff]8* ]]; then
+        s_ok='✓' s_warn='!' s_err='✗' s_dot='·' s_ell='…'
+    else
+        s_ok='ok' s_warn='!' s_err='x' s_dot='-' s_ell='...'
+    fi
+}
+
+ok() { printf '  %s%s%s %s\n' "$c_green" "$s_ok" "$c_reset" "$*"; }
+warn() { printf '  %s%s%s %s\n' "$c_yellow" "$s_warn" "$c_reset" "$*"; }
+fail() { printf '  %s%s%s %s\n' "$c_red" "$s_err" "$c_reset" "$*"; }
+note() { printf '  %s%s%s\n' "$c_dim" "$*" "$c_reset"; }
+heading() { printf '\n%s%s%s\n' "$c_bold" "$*" "$c_reset"; }
+die() { printf 'buildlock: %s\n' "$*" >&2; exit 1; }
+die_usage() { printf 'buildlock: %s\nRun "buildlock help" for usage.\n' "$*" >&2; exit 2; }
+# Option "$1" needs a value in "$2" (called with the parser's "$@").
+need_value() { (( $# >= 2 )) || die_usage "$1 needs a value"; }
+
+# "8m22s", "1h03m", "45s".
+fmt_dur() {
+    local s="${1:-0}"
+    [[ "$s" =~ ^[0-9]+$ ]] || s=0
+    if (( s < 60 )); then printf '%ss' "$s"
+    elif (( s < 3600 )); then printf '%dm%02ds' $(( s / 60 )) $(( s % 60 ))
+    elif (( s < 86400 )); then printf '%dh%02dm' $(( s / 3600 )) $(( s % 3600 / 60 ))
+    else printf '%dd%02dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+    fi
+}
+
+# "512 MB" or "8.0 GB".
+fmt_mb() {
+    local mb="${1:-}"
+    [[ "$mb" =~ ^[0-9]+$ ]] || { printf -- '-'; return; }
+    if (( mb < 1024 )); then printf '%s MB' "$mb"; else printf '%d.%d GB' $(( mb / 1024 )) $(( mb % 1024 * 10 / 1024 )); fi
+}
+
+# $HOME as ~, and long paths cut from the left to $2 characters.
+short_path() {
+    local p="${1:-}" max="${2:-32}"
+    [[ "$p" != "$HOME"* ]] || p="~${p#"$HOME"}"
+    (( ${#p} <= max )) || p="${s_ell}${p: -$(( max - ${#s_ell} ))}"
+    printf '%s' "$p"
+}
+
+# $HOME inside a command line shown as ~.
+tilde() { local t='~'; printf '%s' "${1//"$HOME"/$t}"; }
+
+# Cuts $1 to $2 characters with an ellipsis.
+clip() {
+    local s="$1" max="$2"
+    (( max > ${#s_ell} )) || max=$(( ${#s_ell} + 1 ))
+    if (( ${#s} > max )); then printf '%s%s' "${s:0:$(( max - ${#s_ell} ))}" "$s_ell"; else printf '%s' "$s"; fi
+}
+
+term_width() {
+    local cols="${COLUMNS:-}" size
+    if [[ ! "$cols" =~ ^[0-9]+$ ]]; then
+        size="$(stty size 2>/dev/null < /dev/tty)" || size=''
+        cols="${size#* }"
+    fi
+    [[ "$cols" =~ ^[0-9]+$ ]] && (( cols >= 40 )) || cols=100
+    printf '%s' "$cols"
+}
+
+# The command a live buildlock process runs: its arguments after the buildlock
+# script itself, without `run` and run options.
+pid_command() {
+    local args=() i=0 n
+    mapfile -d '' args 2>/dev/null < "/proc/$1/cmdline" || return 0
+    n="${#args[@]}"
+    while (( i < n )) && [[ "${args[i]##*/}" != *buildlock* ]]; do i=$(( i + 1 )); done
+    i=$(( i + 1 ))
+    [[ "${args[i]:-}" != run ]] || i=$(( i + 1 ))
+    while (( i < n )); do
+        case "${args[i]}" in
+            --light|--heavy) i=$(( i + 1 )) ;;
+            --memory|--timeout) i=$(( i + 2 )) ;;
+            --memory=*|--timeout=*) i=$(( i + 1 )) ;;
+            --) i=$(( i + 1 )); break ;;
+            *) break ;;
+        esac
+    done
+    (( i < n )) || return 0
+    printf '%s' "${args[*]:i}"
+}
+
+join_by() { local sep="$1" out="$2"; shift 2 || true; for _x in "$@"; do out+="$sep$_x"; done; printf '%s' "$out"; }
+
+self_path() { readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0"; }
+
+# Runs env "$@" with the caller's original environment: this process exports
+# BUILDLOCK_WORKERS (possibly a quiet-hours value), which a child would
+# otherwise read as set by the caller.
+clean_env() {
+    local args=()
+    [[ -n "${env_values[BUILDLOCK_WORKERS]+set}" ]] || args+=(-u BUILDLOCK_WORKERS)
+    env "${args[@]}" "$@"
+}
+
+# The path buildlock was run as, symlinks not followed: update and uninstall
+# act on this, so a link into a git checkout never rewrites the checkout.
+invoked_path() {
+    local p="${BASH_SOURCE[0]}"
+    [[ "$p" == */* ]] || p="$(type -P -- "$p")"
+    printf '%s/%s' "$(cd "$(dirname -- "$p")" && pwd)" "${p##*/}"
+}
+
+# Total RAM in MB from meminfo.
+total_ram_mb() { awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' "$proc_root/meminfo" 2>/dev/null || printf 0; }
+
+quiet_summary() {
+    case "$quiet_reason" in
+        forced) printf 'quiet mode on (BUILDLOCK_QUIET)' ;;
+        forced-off) printf 'quiet mode off (BUILDLOCK_QUIET)' ;;
+        hours) printf 'quiet hours %s (now)' "$BUILDLOCK_QUIET_HOURS" ;;
+        outside-hours) printf 'quiet hours %s' "$BUILDLOCK_QUIET_HOURS" ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# status
+
+status_human() {
+    local holders summary heavy_count light_count jobs reason light_reason metrics width cmd_w where_w
+    local load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full ram quiet
+    local slot pid started cwd memory class key queued_at n=0 cmd label
+    holders="$(live_holders)"
+    summary="$(running_summary)"
+    read -r heavy_count light_count jobs <<< "$summary"
+    idle_check "$holders"
+    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    light_reason="$(job_memory_mb="$default_light_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+    metrics="$(proc_metrics)"
+    read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
+    ram="$(total_ram_mb)"
+    width="$(term_width)"
+    where_w=26
+    cmd_w=$(( width - 2 - 6 - 9 - 8 - 9 - where_w - 5 ))
+    (( cmd_w >= 16 )) || cmd_w=16
+
+    quiet="$(quiet_summary)"
+    printf '%sbuildlock %s%s %s %s cores %s %s RAM%s\n' "$c_bold" "$bl_version" "$c_reset" "$s_dot" "$cores" "$s_dot" "$(fmt_mb "$ram")" "${quiet:+ $s_dot $quiet}"
+
+    label="heavy $heavy_count/$slots"
+    (( max_jobs == slots )) || label+=" (up to $max_jobs when idle)"
+    label+=" $s_dot light $light_count/$light_slots"
+    printf '\n%sRunning%s  %s\n' "$c_bold" "$c_reset" "$label"
+    if [[ -n "$holders" ]]; then
+        printf '  %s%-5s %-8s %-7s %-8s %-*s %s%s\n' "$c_dim" SLOT PID AGE BUDGET "$where_w" WHERE COMMAND "$c_reset"
+        while IFS=$'\t' read -r slot pid started cwd memory class; do
+            [[ -n "$pid" ]] || continue
+            cmd="$(tilde "$(pid_command "$pid")")"
+            [[ "$slot" == light* ]] || slot="h$slot"
+            slot="${slot/light/l}"
+            printf '  %-5s %-8s %-7s %-8s %-*s %s\n' "$slot" "$pid" "$(fmt_dur "$(( EPOCHSECONDS - ${started:-$EPOCHSECONDS} ))")" \
+                "$(fmt_mb "$memory")" "$where_w" "$(short_path "$cwd" "$where_w")" "$(clip "$cmd" "$cmd_w")"
+        done <<< "$holders"
+    else
+        note "nothing running"
+    fi
+
+    printf '\n%sQueued%s   ' "$c_bold" "$c_reset"
+    local queued
+    queued="$(queue_entries)"
+    if [[ -z "$queued" ]]; then
+        printf 'none\n'
+    else
+        printf '%s\n' "$(printf '%s\n' "$queued" | grep -c .)"
+        printf '  %s%-3s %-6s %-8s %-8s %-*s %s%s\n' "$c_dim" '#' CLASS PID WAITING "$where_w" WHERE COMMAND "$c_reset"
+        while IFS=$'\t' read -r key pid queued_at cwd class; do
+            [[ -n "$pid" ]] || continue
+            n=$(( n + 1 ))
+            printf '  %-3s %-6s %-8s %-8s %-*s %s\n' "$n" "$class" "$pid" "$(fmt_dur "$(( EPOCHSECONDS - queued_at ))")" \
+                "$where_w" "$(short_path "$cwd" "$where_w")" "$(clip "$(tilde "$(pid_command "$pid")")" "$cmd_w")"
+        done <<< "$queued"
+    fi
+
+    printf '\n%sMachine%s  load %s/%s %s %s free' "$c_bold" "$c_reset" "$load1" "$load_max" "$s_dot" "$(fmt_mb "$avail_mb")"
+    if (( swap_total_mb > 0 )); then printf ' %s swap %s%% free' "$s_dot" $(( swap_free_mb * 100 / swap_total_mb )); fi
+    if [[ -r "$proc_root/pressure/cpu" ]]; then printf ' %s pressure cpu %s%% io %s%% mem %s%%' "$s_dot" "$cpu" "$io" "$mem_some"; fi
+    if [[ "$idle" == 1 ]]; then printf ' %s %sidle%s' "$s_dot" "$c_green" "$c_reset"; fi
+    printf '\n'
+    printf '%sNext%s     heavy: %s\n' "$c_bold" "$c_reset" "$(verdict_text "$reason")"
+    printf '         light: %s\n' "$(verdict_text "$light_reason")"
+}
+
+verdict_text() {
+    if [[ -z "$1" ]]; then printf '%sstarts now%s' "$c_green" "$c_reset"; else printf '%swaits%s %s %s' "$c_yellow" "$c_reset" "$s_dot" "$1"; fi
+}
+
+status_json() {
+    local holders summary heavy_count light_count jobs reason light_reason metrics sep=''
+    local load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full
+    local slot pid started cwd memory class key queued_at quiet_json=false
+    holders="$(live_holders)"
+    summary="$(running_summary)"
+    read -r heavy_count light_count jobs <<< "$summary"
+    idle_check "$holders"
+    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    light_reason="$(job_memory_mb="$default_light_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+    metrics="$(proc_metrics)"
+    read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
+    (( quiet_active == 0 )) || quiet_json=true
+    printf '{"version":"%s","cores":%s,"quiet":%s,"idle":%s,"expectedLoad":%s,' "$bl_version" "$cores" "$quiet_json" \
+        "$([[ "$idle" == 1 ]] && printf true || printf false)" "${expected_load:-0}"
+    printf '"lanes":{"heavy":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s"},"light":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s"}},' \
+        "$heavy_count" "$slots" "$max_jobs" "$(json_escape "${reason:-start}")" "$light_count" "$light_slots" "$light_max_jobs" "$(json_escape "${light_reason:-start}")"
+    printf '"running":['
+    while IFS=$'\t' read -r slot pid started cwd memory class; do
+        [[ -n "$pid" ]] || continue
+        [[ "$started" =~ ^[0-9]+$ ]] || started="$EPOCHSECONDS"
+        printf '%s{"slot":"%s","class":"%s","pid":%s,"startedAt":%s,"ageSeconds":%s,"cwd":"%s","budgetMb":%s,"command":"%s"}' "$sep" \
+            "$slot" "$class" "$pid" "$started" "$(( EPOCHSECONDS - started ))" "$(json_escape "$cwd")" \
+            "$([[ "$memory" =~ ^[0-9]+$ ]] && printf '%s' "$memory" || printf null)" "$(json_escape "$(pid_command "$pid")")"
+        sep=','
+    done <<< "$holders"
+    printf '],"queued":['
+    sep=''
+    while IFS=$'\t' read -r key pid queued_at cwd class; do
+        [[ -n "$pid" ]] || continue
+        printf '%s{"class":"%s","pid":%s,"queuedAt":%s,"waitingSeconds":%s,"cwd":"%s","command":"%s"}' "$sep" \
+            "$class" "$pid" "$queued_at" "$(( EPOCHSECONDS - queued_at ))" "$(json_escape "$cwd")" "$(json_escape "$(pid_command "$pid")")"
+        sep=','
+    done <<< "$(queue_entries)"
+    printf '],"machine":{"load1":%s,"loadMax":%s,"availableMb":%s,"totalMb":%s,"swapTotalMb":%s,"swapFreeMb":%s,"cpuPressure":%s,"ioPressure":%s,"memoryPressure":%s}}\n' \
+        "${load1:-0}" "$load_max" "${avail_mb:-0}" "$(total_ram_mb)" "${swap_total_mb:-0}" "${swap_free_mb:-0}" "${cpu:-0}" "${io:-0}" "${mem_some:-0}"
+}
+
+cmd_status() {
+    local json=0 watch=0 interval=2 frame pause_fd
+    while (( $# > 0 )); do
+        case "$1" in
+            --json) json=1 ;;
+            -w|--watch) watch=1 ;;
+            -i|--interval) need_value "$@"; interval="$2"; shift ;;
+            --interval=*) interval="${1#*=}" ;;
+            -h|--help) help_status; return 0 ;;
+            *) die_usage "status: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || die_usage "status: --interval needs seconds"
+    if (( json == 1 )); then status_json; return 0; fi
+    if (( watch == 0 )); then status_human; return 0; fi
+    [[ -t 1 ]] || die "status --watch needs a terminal"
+    exec {pause_fd}<> <(:)
+    trap 'printf "\e[?25h\n"; exit 0' INT TERM
+    printf '\e[?25l'
+    while :; do
+        frame="$(status_human)"
+        printf '\e[H\e[2J%s\n\n%s%s Refreshing every %ss %s Ctrl-C to quit%s' "$frame" "$c_dim" "$(printf '%(%H:%M:%S)T' -1)" "$interval" "$s_dot" "$c_reset"
+        read -r -t "$interval" -u "$pause_fd" _ || true
+    done
+}
+
+# ---------------------------------------------------------------------------
+# history / stats: read the job log.
+
+# Job-log files of the current and previous month, or every month with $1 = all.
+log_files() {
+    local cur_month prev_month year month file
+    if [[ "${1:-}" == all ]]; then
+        for file in "$job_log_dir"/jobs-*.jsonl; do printf '%s\n' "$file"; done
+        return 0
+    fi
+    TZ=UTC printf -v cur_month '%(%Y-%m)T' -1
+    year="${cur_month%-*}"
+    month=$(( 10#${cur_month#*-} - 1 ))
+    (( month > 0 )) || { month=12; year=$(( year - 1 )); }
+    printf -v prev_month '%04d-%02d' "$year" "$month"
+    for file in "$job_log_dir/jobs-$prev_month.jsonl" "$job_log_dir/jobs-$cur_month.jsonl"; do
+        [[ -r "$file" ]] && printf '%s\n' "$file"
+    done
+    return 0
+}
+
+# awk functions that read one field of a job-log line.
+awk_json_lib='
+function jstr(s, key,   re, v, i) {
+    re = "\"" key "\":\"([^\"\\\\]|\\\\.)*\""
+    if (!match(s, re)) return ""
+    v = substr(s, RSTART + length(key) + 4, RLENGTH - length(key) - 5)
+    if (index(v, "\\")) {
+        gsub(/\\\\/, "\001", v)
+        gsub(/\\"/, "\"", v)
+        gsub(/\\[ntr]/, " ", v)
+        gsub(/\\u[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]/, "?", v)
+        while ((i = index(v, "\001")) > 0) v = substr(v, 1, i - 1) "\\" substr(v, i + 1)
+    }
+    return v
+}
+function jnum(s, key,   p, rest) {
+    p = index(s, "\"" key "\":")
+    if (!p) return ""
+    rest = substr(s, p + length(key) + 3)
+    if (match(rest, /^-?[0-9]+(\.[0-9]+)?/)) return substr(rest, 1, RLENGTH)
+    return ""
+}
+function isort(a, n,   i, j, k) {
+    for (i = 2; i <= n; i++) { k = a[i]; j = i - 1; while (j >= 1 && a[j] > k) { a[j + 1] = a[j]; j-- }; a[j + 1] = k }
+}
+function pct(a, n, q,   i) {
+    if (n < 1) return 0
+    i = int(q * n); if (q * n > i) i++; if (i < 1) i = 1
+    return a[i]
+}
+'
+
+cmd_history() {
+    local limit=20 here=0 failed=0 json=0 scope='' needle='' files=() rows=() whens=() row i width cmd_w where_w
+    local at wait run peak code code_color class cwd cmd total
+    while (( $# > 0 )); do
+        case "$1" in
+            -n|--limit) need_value "$@"; limit="$2"; shift ;;
+            -n*) limit="${1#-n}" ;;
+            --limit=*) limit="${1#*=}" ;;
+            --here) here=1 ;;
+            --failed) failed=1 ;;
+            --all) scope=all ;;
+            --json) json=1 ;;
+            -h|--help) help_history; return 0 ;;
+            *) die_usage "history: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    [[ "$limit" =~ ^[0-9]+$ ]] && (( limit > 0 )) || die_usage "history: -n needs a positive number"
+    mapfile -t files < <(log_files "$scope")
+    if (( ${#files[@]} == 0 )); then
+        printf 'No jobs logged yet (%s).\n' "$(short_path "$job_log_dir" 60)"
+        return 0
+    fi
+    (( here == 0 )) || needle="\"key\":\"$(json_escape "$(repo_root)")::"
+    local filter='
+        (needle == "" || index($0, needle)) && (failed == 0 || $0 !~ /"exit":0[,}]/) && /^\{/ { n++; ring[n % limit] = $0 }
+        END {
+            start = n > limit ? n - limit + 1 : 1
+            for (i = start; i <= n; i++) print ring[i % limit]
+            print n > "/dev/stderr"
+        }'
+    if (( json == 1 )); then
+        awk -v needle="$needle" -v failed="$failed" -v limit="$limit" "$filter" "${files[@]}" 2>/dev/null
+        return 0
+    fi
+    total="$( { awk -v needle="$needle" -v failed="$failed" -v limit="$limit" "$filter" "${files[@]}" > /dev/null; } 2>&1 )"
+    width="$(term_width)"
+    where_w=24
+    cmd_w=$(( width - 2 - 12 - 8 - 8 - 8 - 5 - 6 - where_w - 7 ))
+    (( cmd_w >= 16 )) || cmd_w=16
+    # Formatting happens in awk: a fork per cell would make -n 1000 take minutes.
+    # Fields are \x1f-separated (tab is IFS whitespace, so empty fields would collapse).
+    mapfile -t rows < <(awk -v needle="$needle" -v failed="$failed" -v limit="$limit" "$filter" "${files[@]}" 2>/dev/null \
+        | awk -v home="$HOME" -v where_w="$where_w" -v cmd_w="$cmd_w" -v ell="$s_ell" "$awk_json_lib"'
+            function dur(s) {
+                s = int(s + 0)
+                if (s < 60) return s "s"
+                if (s < 3600) return sprintf("%dm%02ds", s / 60, s % 60)
+                if (s < 86400) return sprintf("%dh%02dm", s / 3600, (s % 3600) / 60)
+                return sprintf("%dd%02dh", s / 86400, (s % 86400) / 3600)
+            }
+            function mb(m) {
+                if (m == "") return "-"
+                m = int(m)
+                return m < 1024 ? m " MB" : sprintf("%d.%d GB", m / 1024, (m % 1024) * 10 / 1024)
+            }
+            function tilde(p,   i) {
+                while (home != "" && (i = index(p, home)) > 0) p = substr(p, 1, i - 1) "~" substr(p, i + length(home))
+                return p
+            }
+            function clip(t, max) { return length(t) > max ? substr(t, 1, max - 1) ell : t }
+            function left(t, max) { return length(t) > max ? ell substr(t, length(t) - max + 2) : t }
+            {
+                class = jstr($0, "class"); if (class == "") class = "heavy"
+                printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n", jstr($0, "at"), dur(jnum($0, "waitSeconds")), dur(jnum($0, "runSeconds")),
+                    mb(jnum($0, "peakMb")), jnum($0, "exit"), class, left(tilde(jstr($0, "cwd")), where_w), clip(tilde(jstr($0, "cmd")), cmd_w)
+            }' | sort)
+    if (( ${#rows[@]} == 0 )); then
+        printf 'No matching jobs.\n'
+        return 0
+    fi
+    mapfile -t whens < <(printf '%s\n' "${rows[@]%%$'\x1f'*}" | date -f - '+%m-%d %H:%M' 2>/dev/null || true)
+    printf '  %s%-12s %-8s %-8s %-8s %-5s %-6s %-*s %s%s\n' "$c_dim" WHEN WAITED RAN PEAK EXIT LANE "$where_w" WHERE COMMAND "$c_reset"
+    for i in "${!rows[@]}"; do
+        IFS=$'\x1f' read -r at wait run peak code class cwd cmd <<< "${rows[i]}"
+        if [[ "$code" == 0 ]]; then code_color="$c_green"; else code_color="$c_red"; fi
+        printf '  %-12s %-8s %-8s %-8s %s%-5s%s %-6s %-*s %s\n' "${whens[i]:-${at:5:11}}" "$wait" "$run" "$peak" \
+            "$code_color" "${code:--}" "$c_reset" "$class" "$where_w" "$cwd" "$cmd"
+    done
+    if [[ "$total" =~ ^[0-9]+$ ]] && (( total > ${#rows[@]} )); then
+        note "Showing the last ${#rows[@]} of $total jobs. More: buildlock history -n 100${scope:+ --all}"
+    fi
+}
+
+cmd_stats() {
+    local days=30 here=0 limit=15 needle='' files=() cutoff out rows=() width cmd_w
+    local total_run n fails p50 p90 peak est lane avg_wait key repo cmd summary
+    while (( $# > 0 )); do
+        case "$1" in
+            --days) need_value "$@"; days="$2"; shift ;;
+            --days=*) days="${1#*=}" ;;
+            -n|--limit) need_value "$@"; limit="$2"; shift ;;
+            --limit=*) limit="${1#*=}" ;;
+            --here) here=1 ;;
+            -h|--help) help_stats; return 0 ;;
+            *) die_usage "stats: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    [[ "$days" =~ ^[0-9]+$ ]] && (( days > 0 )) || die_usage "stats: --days needs a positive number"
+    [[ "$limit" =~ ^[0-9]+$ ]] && (( limit > 0 )) || die_usage "stats: -n needs a positive number"
+    mapfile -t files < <(log_files all)
+    if (( ${#files[@]} == 0 )); then
+        printf 'No jobs logged yet (%s).\n' "$(short_path "$job_log_dir" 60)"
+        return 0
+    fi
+    cutoff="$(date -u -d "-$days days" +%Y-%m-%dT%H:%M:%SZ)"
+    (( here == 0 )) || needle="\"key\":\"$(json_escape "$(repo_root)")::"
+    out="$(awk -v needle="$needle" -v cutoff="$cutoff" -v light_mb="$light_max_mb" -v light_s="$light_max_seconds" "$awk_json_lib"'
+        /^\{/ && (needle == "" || index($0, needle)) {
+            key = jstr($0, "key"); if (key == "") next
+            peak = jnum($0, "peakMb") + 0; run = jnum($0, "runSeconds") + 0
+            c = ++seen[key]; rp[key, (c - 1) % 20] = peak; rr[key, (c - 1) % 20] = run
+            if (jstr($0, "at") < cutoff) next
+            wait = jnum($0, "waitSeconds") + 0
+            k = ++n[key]; runs[key, k] = run; trun[key] += run; twait[key] += wait
+            if (jnum($0, "exit") != "0") fails[key]++
+            all++; all_run += run; all_wait += wait; if (jnum($0, "exit") != "0") all_fail++; wait_count[wait]++
+        }
+        END {
+            for (key in n) {
+                m = n[key]; delete a; for (i = 1; i <= m; i++) a[i] = runs[key, i]; isort(a, m)
+                p50 = pct(a, m, 0.5); p90 = pct(a, m, 0.9)
+                w = seen[key] < 20 ? seen[key] : 20
+                delete b; delete r; for (i = 0; i < w; i++) { b[i + 1] = rp[key, i]; r[i + 1] = rr[key, i] }
+                isort(b, w); isort(r, w)
+                peak = pct(b, w, 0.9); est = ""; lane = "heavy"
+                if (w >= 3) {
+                    est = int(peak * 1.25 + 256); if (est < 512) est = 512
+                    if (key ~ /::light$/) { if (est <= light_mb) lane = "light" }
+                    else if (key !~ /::heavy$/ && est <= light_mb && pct(r, w, 0.9) <= light_s) lane = "light"
+                } else lane = "new"
+                printf "%d\037%d\037%d\037%d\037%d\037%d\037%s\037%s\037%d\037%s\n", trun[key], m, fails[key], p50, p90, peak, est, lane, twait[key] / m, key
+            }
+            # p90 wait from distinct values: an O(n^2) sort over every job is too slow for a busy log.
+            d = 0; for (v in wait_count) dv[++d] = v + 0
+            isort(dv, d)
+            target = int(0.9 * all); if (0.9 * all > target) target++; seen_n = 0; p90w = 0
+            for (i = 1; i <= d; i++) { seen_n += wait_count[dv[i]]; if (seen_n >= target) { p90w = dv[i]; break } }
+            printf "#\037%d\037%d\037%d\037%d\037%d\n", all, all_run, all_wait, p90w, all_fail
+        }' "${files[@]}" 2>/dev/null)"
+    summary="$(grep '^#' <<< "$out" || true)"
+    mapfile -t rows < <(grep -v '^#' <<< "$out" | sort -t $'\x1f' -k1,1nr | head -n "$limit")
+    local all all_run all_wait p90_wait all_fail
+    IFS=$'\x1f' read -r _ all all_run all_wait p90_wait all_fail <<< "$summary"
+    if [[ ! "${all:-}" =~ ^[0-9]+$ ]] || (( all == 0 )); then
+        printf 'No jobs in the last %s days.\n' "$days"
+        return 0
+    fi
+    printf '%s%s jobs%s in the last %s days %s ran %s %s waited %s (p90 wait %s) %s %s%% failed\n\n' "$c_bold" "$all" "$c_reset" "$days" "$s_dot" \
+        "$(fmt_dur "$all_run")" "$s_dot" "$(fmt_dur "$all_wait")" "$(fmt_dur "$p90_wait")" "$s_dot" $(( all_fail * 100 / all ))
+    width="$(term_width)"
+    cmd_w=$(( width - 2 - 5 - 5 - 8 - 8 - 8 - 9 - 6 - 8 - 9 ))
+    (( cmd_w >= 20 )) || cmd_w=20
+    printf '  %s%-5s %-5s %-8s %-8s %-8s %-9s %-6s %-8s %s%s\n' "$c_dim" RUNS FAIL TOTAL 'P50 RUN' 'P90 RUN' BUDGET LANE 'AVG WAIT' COMMAND "$c_reset"
+    for row in "${rows[@]}"; do
+        IFS=$'\x1f' read -r total_run n fails p50 p90 peak est lane avg_wait key <<< "$row"
+        repo="${key%%::*}"
+        cmd="${key#*::}"
+        cmd="${cmd%::light}"
+        cmd="${cmd%::heavy}"
+        printf '  %-5s %-5s %-8s %-8s %-8s %-9s %-6s %-8s %s\n' "$n" "$fails" "$(fmt_dur "$total_run")" "$(fmt_dur "$p50")" "$(fmt_dur "$p90")" \
+            "$( [[ -n "$est" ]] && fmt_mb "$est" || printf -- '-')" "$lane" "$(fmt_dur "$avg_wait")" "$(clip "${repo##*/}: $cmd" "$cmd_w")"
+    done
+    note ""
+    note "BUDGET is the memory buildlock now reserves for the command (p90 of its last 20 peaks x 1.25 + 256 MB); LANE \"new\" means fewer than 3 runs so far."
+}
+
+# ---------------------------------------------------------------------------
+# config
+
+# KEY|type|variable holding the effective value|summary. Types: int, num,
+# hours, onoff, quiet, path.
+settings_table() {
+    cat <<'EOF'
+SLOTS|int|slots|Heavy jobs at once on a busy machine (default: cores / WORKERS)
+WORKERS|int|BUILDLOCK_WORKERS|Test workers per heavy job, exported as VITEST_MAX_WORKERS and JEST_MAX_WORKERS
+MAX_JOBS|int|max_jobs|Heavy jobs at once while the machine is idle (default: cores / 4, or SLOTS when SLOTS is set)
+LIGHT_SLOTS|int|light_slots|Light jobs at once (default: cores / 4)
+LIGHT_MAX_JOBS|int|light_max_jobs|Light jobs at once while the machine is idle (default: cores / 2)
+START_GAP|int|start_gap|Seconds between two heavy starts, so the last one shows its load first
+LOAD_MAX|num|load_max|No job starts beside others while the 1-minute load is at or above this (default: cores x 1.25)
+CPU_PRESSURE_MAX|num|cpu_pressure_max|Ceiling for CPU "some" pressure, % (avg10)
+IO_PRESSURE_MAX|num|io_pressure_max|Ceiling for IO "full" pressure, %
+MEMORY_PRESSURE_MAX|num|memory_pressure_max|Ceiling for memory "some" pressure, %
+RESERVE_MEMORY_MB|int|reserve_memory_mb|Memory kept free after a new job and the growth of jobs still starting up
+CRITICAL_MEMORY_MB|int|critical_memory_mb|Below this much available memory nothing starts, not even a lone job
+DEFAULT_MEMORY_MB|int|default_heavy_mb|Assumed peak memory of a heavy command with no history yet
+DEFAULT_LIGHT_MEMORY_MB|int|default_light_mb|Assumed peak memory of a light command with no history yet
+LIGHT_MAX_MB|int|light_max_mb|A command that peaks under this much memory...
+LIGHT_MAX_SECONDS|int|light_max_seconds|...and finishes within this many seconds moves to the light lane on its own
+RAMP_SECONDS|int|ramp_seconds|For this long after it starts, a job may still grow toward its memory budget
+IDLE_LOAD_RATIO|num|idle_load_ratio|The machine counts as idle below cores x this expected load
+PROFILE|onoff|profile_mode|Learn each command's memory and run time from the job log
+JOB_LOG_DIR|path|job_log_dir|Where the job log is kept
+QUIET|quiet|BUILDLOCK_QUIET|Quiet mode: auto (follow QUIET_HOURS), on or off
+QUIET_HOURS|hours|BUILDLOCK_QUIET_HOURS|Hours with tighter limits, e.g. 00:00-08:00 (comma-separate several)
+QUIET_SLOTS|int|BUILDLOCK_QUIET_SLOTS|Heavy jobs at once during quiet hours
+QUIET_WORKERS|int|BUILDLOCK_QUIET_WORKERS|Test workers per heavy job during quiet hours
+QUIET_LIGHT_SLOTS|int|BUILDLOCK_QUIET_LIGHT_SLOTS|Light jobs at once during quiet hours
+QUIET_MAX_JOBS|int|BUILDLOCK_QUIET_MAX_JOBS|Heavy jobs at once in quiet hours even when idle (default: QUIET_SLOTS)
+QUIET_LIGHT_MAX_JOBS|int|BUILDLOCK_QUIET_LIGHT_MAX_JOBS|Light jobs at once in quiet hours even when idle (default: QUIET_LIGHT_SLOTS)
+EOF
+}
+
+# "SLOTS" from "slots", "buildlock_slots", "light-slots".
+normalize_key() {
+    local key="${1^^}"
+    key="${key//-/_}"
+    printf '%s' "${key#BUILDLOCK_}"
+}
+
+setting_row() {
+    local key="$1" row
+    while IFS= read -r row; do
+        [[ "${row%%|*}" == "$key" ]] && { printf '%s' "$row"; return 0; }
+    done < <(settings_table)
+    return 1
+}
+
+validate_setting() {
+    local type="$1" value="$2"
+    case "$type" in
+        int) [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] ;;
+        num) [[ "$value" =~ ^(0|[1-9][0-9]*)([.][0-9]+)?$ ]] ;;
+        hours) valid_hours "$value" ;;
+        onoff) [[ "$value" == on || "$value" == off ]] ;;
+        quiet) [[ "$value" == auto || "$value" == on || "$value" == off ]] ;;
+        path) [[ "$value" == /* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+type_hint() {
+    case "$1" in
+        int) printf 'a whole number' ;;
+        num) printf 'a number' ;;
+        hours) printf 'hours like 00:00-08:00 or 22-06,12-13' ;;
+        onoff) printf 'on or off' ;;
+        quiet) printf 'auto, on or off' ;;
+        path) printf 'an absolute directory path' ;;
+    esac
+}
+
+source_of() {
+    local var="BUILDLOCK_$1"
+    if [[ -n "${env_values[$var]+set}" ]]; then printf env
+    elif [[ -n "${from_quiet[$var]+set}" ]]; then printf quiet
+    elif [[ -n "${from_config[$var]+set}" ]]; then printf config
+    else printf default
+    fi
+}
+
+config_marker_begin='# >>> buildlock config >>>'
+config_marker_end='# <<< buildlock config <<<'
+
+config_template() {
+    cat <<EOF
+# buildlock configuration · $bl_home#configuration
+#
+# Bash sourced on every buildlock call; the caller's environment variables win
+# over it. \`buildlock config\` rewrites the lines between the markers. Put your
+# own shell code after them, for example to follow a power profile:
+#   [[ \$(cat /sys/devices/system/cpu/cpufreq/boost 2>/dev/null) == 0 ]] && BUILDLOCK_QUIET=on
+$config_marker_begin
+$config_marker_end
+EOF
+}
+
+# Atomically replaces file $1 with stdin, keeping its mode; follows a symlink
+# to its target so the link itself survives.
+write_atomic() {
+    local file real tmp
+    file="$1"
+    real="$(readlink -m -- "$file")"
+    mkdir -p "$(dirname "$real")"
+    tmp="$(mktemp "$(dirname "$real")/.buildlock.XXXXXX")"
+    cat > "$tmp"
+    if [[ -e "$real" ]]; then chmod --reference="$real" "$tmp" 2>/dev/null || true; else chmod 644 "$tmp"; fi
+    mv -f "$tmp" "$real"
+}
+
+# Sets BUILDLOCK_$1 to $2 in the config file's managed block, or removes it
+# when $2 is absent.
+config_write() {
+    local key="BUILDLOCK_$1" set_value=0 line trimmed lines=() out=() i begin=-1 end=-1 begins=0 ends=0 assignment=''
+    if (( $# >= 2 )); then set_value=1; printf -v assignment '%s=%q' "$key" "$2"; fi
+    [[ -n "$config_file" ]] || die "config is disabled (BUILDLOCK_CONFIG is empty)"
+    if [[ -f "$config_file" ]]; then mapfile -t lines < "$config_file"; else mapfile -t lines < <(config_template); fi
+    for i in "${!lines[@]}"; do
+        trimmed="${lines[i]%"${lines[i]##*[![:space:]]}"}"
+        if [[ "$trimmed" == "$config_marker_begin" ]]; then begins=$(( begins + 1 )); begin="$i"; fi
+        if [[ "$trimmed" == "$config_marker_end" ]]; then ends=$(( ends + 1 )); end="$i"; fi
+    done
+    if (( begins == 0 && ends == 0 )); then
+        # A hand-written file: the block goes first, so its own code still runs after (and wins over) it.
+        lines=("$config_marker_begin" "$config_marker_end" "${lines[@]}")
+        begin=0
+        end=1
+    elif (( begins != 1 || ends != 1 || begin > end )); then
+        die "the markers in $(short_path "$config_file" 60) are broken: expected one \"$config_marker_begin\" line followed by one \"$config_marker_end\" line. Fix them with: buildlock config edit"
+    fi
+    out=("${lines[@]:0:begin+1}")
+    for (( i = begin + 1; i < end; i++ )); do
+        line="${lines[i]}"
+        if [[ "$line" == "$key="* ]]; then
+            if (( set_value == 1 )); then out+=("$assignment"); set_value=2; fi
+            continue
+        fi
+        out+=("$line")
+    done
+    if (( set_value == 1 )); then out+=("$assignment"); fi
+    out+=("${lines[@]:end}")
+    printf '%s\n' "${out[@]}" | write_atomic "$config_file"
+}
+
+# Warns when code after the markers (or the environment) still decides KEY $1
+# after config_write, instead of reporting a change that did not happen. $2 is
+# the value written, or empty after an unset.
+config_check_effect() {
+    local key="$1" want="${2:-}" got quiet_env=(BUILDLOCK_QUIET=off)
+    [[ "$key" != QUIET ]] || quiet_env=()
+    got="$(clean_env -u "BUILDLOCK_$key" "${quiet_env[@]}" "$(self_path)" config get --raw "$key" 2>/dev/null)" || return 0
+    if [[ "$got" != "$want" ]]; then
+        warn "code after the markers in $(short_path "$config_file" 60) sets $key to '${got}' and wins; change it there (buildlock config edit)"
+    fi
+    if [[ -n "${env_values[BUILDLOCK_$key]+set}" ]]; then
+        warn "BUILDLOCK_$key is set in your environment, which wins over the config file."
+    fi
+    return 0
+}
+
+# Prints KEY<TAB>value<TAB>source<TAB>summary for every setting.
+config_rows() {
+    local key type var summary value
+    while IFS='|' read -r key type var summary; do
+        value="${!var:-}"
+        [[ "$key" != QUIET || -n "$value" ]] || value=auto
+        printf '%s\t%s\t%s\t%s\n' "$key" "${value:--}" "$(source_of "$key")" "$summary"
+    done < <(settings_table)
+}
+
+cmd_config() {
+    local sub="${1:-}"
+    [[ $# -eq 0 ]] || shift
+    case "$sub" in
+        '') if [[ -t 0 && -t 1 ]]; then config_menu; else config_list; fi ;;
+        list|ls) config_list "$@" ;;
+        get) config_get "$@" ;;
+        set) config_set "$@" ;;
+        unset|reset) config_unset "$@" ;;
+        edit) config_edit ;;
+        path) printf '%s\n' "${config_file:-(disabled)}" ;;
+        -h|--help|help) help_config ;;
+        *) die_usage "config: unknown subcommand '$sub' (list, get, set, unset, edit, path)" ;;
+    esac
+}
+
+config_list() {
+    local tsv=0 key value source summary color
+    [[ "${1:-}" != --tsv ]] || tsv=1
+    if (( tsv == 1 )); then config_rows; return 0; fi
+    printf '%sbuildlock settings%s %s %s\n' "$c_bold" "$c_reset" "$s_dot" "$(short_path "${config_file:-(no config file)}" 60)"
+    (( quiet_active == 0 )) || note "Quiet mode is on now: QUIET_* values replace their normal ones."
+    printf '\n  %s%-24s %-14s %-8s %s%s\n' "$c_dim" KEY VALUE SOURCE DESCRIPTION "$c_reset"
+    while IFS=$'\t' read -r key value source summary; do
+        color=''
+        [[ "$source" == default ]] || color="$c_cyan"
+        printf '  %-24s %s%-14s%s %-8s %s%s%s\n' "$key" "$color" "$(clip "$value" 14)" "$c_reset" "$source" "$c_dim" "$summary" "$c_reset"
+    done < <(config_rows)
+    note ""
+    note "Change one: buildlock config set SLOTS 2 · interactive: buildlock config · env BUILDLOCK_<KEY> overrides"
+}
+
+config_get() {
+    local key row var raw=0
+    if [[ "${1:-}" == --raw ]]; then raw=1; shift; fi
+    (( $# == 1 )) || die_usage "usage: buildlock config get KEY"
+    key="$(normalize_key "$1")"
+    # --raw: the BUILDLOCK_<KEY> variable itself after loading, for config_check_effect.
+    if (( raw == 1 )); then var="BUILDLOCK_$key"; printf '%s\n' "${!var-}"; return 0; fi
+    row="$(setting_row "$key")" || die "unknown setting '$1' (buildlock config list shows them)"
+    IFS='|' read -r _ _ var _ <<< "$row"
+    printf '%s\n' "${!var:-}"
+}
+
+config_set() {
+    local key row type value force=0 summary
+    if [[ "${1:-}" == --force ]]; then force=1; shift; fi
+    (( $# == 2 )) || die_usage "usage: buildlock config set KEY VALUE"
+    key="$(normalize_key "$1")"
+    value="$2"
+    if row="$(setting_row "$key")"; then
+        IFS='|' read -r _ type _ summary <<< "$row"
+        if [[ "$value" == default || -z "$value" ]]; then config_unset "$key"; return 0; fi
+        validate_setting "$type" "$value" || die "$key needs $(type_hint "$type"), not '$value'"
+        if [[ "$type" == int && "$value" == 0 ]] && [[ "$key" == *SLOTS || "$key" == *WORKERS || "$key" == *MAX_JOBS || "$key" == *MEMORY_MB ]]; then
+            die "$key must be at least 1"
+        fi
+    elif (( force == 0 )); then
+        die "unknown setting '$1' (buildlock config list shows them; --force writes it anyway)"
+    elif [[ ! "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+        die "not a setting name: '$1'"
+    fi
+    config_write "$key" "$value"
+    printf '%s %s = %s  %s(%s)%s\n' "$s_ok" "$key" "$value" "$c_dim" "$(short_path "$config_file" 60)" "$c_reset"
+    config_check_effect "$key" "$value"
+}
+
+config_unset() {
+    local key
+    (( $# == 1 )) || die_usage "usage: buildlock config unset KEY"
+    key="$(normalize_key "$1")"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "not a setting name: '$1'"
+    if [[ -f "$config_file" ]]; then config_write "$key"; fi
+    printf '%s %s uses its default\n' "$s_ok" "$key"
+    config_check_effect "$key" ''
+}
+
+config_edit() {
+    local editor="${VISUAL:-${EDITOR:-}}"
+    [[ -n "$config_file" ]] || die "config is disabled (BUILDLOCK_CONFIG is empty)"
+    [[ -f "$config_file" ]] || config_template | write_atomic "$config_file"
+    if [[ -z "$editor" ]]; then
+        for editor in nano vim vi; do command -v "$editor" > /dev/null && break; done
+    fi
+    command -v "${editor%% *}" > /dev/null || die "no editor found; set EDITOR"
+    # shellcheck disable=SC2086 # EDITOR may carry arguments ("code -w").
+    $editor "$config_file"
+    if ! bash -n "$config_file" 2>/dev/null; then
+        warn "The config file has a syntax error; buildlock ignores the lines after it:"
+        bash -n "$config_file" 2>&1 | sed 's/^/    /'
+    fi
+}
+
+# Reads one answer from the terminal into the variable named $1. $2 prompt,
+# $3 default, $4 setting type to validate against (optional).
+ask() {
+    local __var="$1" prompt="$2" def="${3:-}" type="${4:-}" answer
+    while :; do
+        printf '%s%s%s%s ' "$c_bold" "$prompt" "$c_reset" "${def:+ ${c_dim}[$def]$c_reset}" > /dev/tty
+        IFS= read -r answer < /dev/tty || { printf '\n' > /dev/tty; exit 130; }
+        answer="${answer:-$def}"
+        if [[ -z "$type" ]] || validate_setting "$type" "$answer"; then
+            printf -v "$__var" '%s' "$answer"
+            return 0
+        fi
+        printf '  %sPlease enter %s.%s\n' "$c_red" "$(type_hint "$type")" "$c_reset" > /dev/tty
+    done
+}
+
+# Yes/no question; $2 is the default (y or n).
+confirm() {
+    local answer hint='[y/N]'
+    [[ "${2:-n}" != y ]] || hint='[Y/n]'
+    while :; do
+        printf '%s%s%s %s%s%s ' "$c_bold" "$1" "$c_reset" "$c_dim" "$hint" "$c_reset" > /dev/tty
+        IFS= read -r answer < /dev/tty || { printf '\n' > /dev/tty; exit 130; }
+        answer="${answer:-${2:-n}}"
+        case "${answer,,}" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+        esac
+    done
+}
+
+have_tty() { { true < /dev/tty; } 2>/dev/null; }
+
+# Interactive settings menu; every change is written at once.
+config_menu() {
+    local self keys=(SLOTS WORKERS LIGHT_SLOTS RESERVE_MEMORY_MB DEFAULT_MEMORY_MB QUIET QUIET_HOURS QUIET_SLOTS QUIET_WORKERS QUIET_LIGHT_SLOTS)
+    local labels=('Heavy jobs at once' 'Test workers per heavy job' 'Light jobs at once' 'Memory to keep free (MB)' 'Memory of a new heavy command (MB)' \
+        'Quiet mode (auto/on/off)' 'Quiet hours' 'Heavy jobs at once, quiet' 'Test workers per job, quiet' 'Light jobs at once, quiet')
+    local choice i key value source summary type row answer
+    declare -A values=() sources=()
+    have_tty || die "buildlock config needs a terminal; use buildlock config set KEY VALUE"
+    self="$(self_path)"
+    while :; do
+        while IFS=$'\t' read -r key value source summary; do values[$key]="$value"; sources[$key]="$source"; done < <(clean_env "$self" config list --tsv)
+        printf '\n%sbuildlock config%s %s %s\n\n' "$c_bold" "$c_reset" "$s_dot" "$(short_path "$config_file" 60)"
+        for i in "${!keys[@]}"; do
+            key="${keys[i]}"
+            source="${sources[$key]}"
+            [[ "$source" != default ]] || source="${c_dim}default${c_reset}"
+            printf '  %s%2d%s  %-36s %s%-14s%s %s\n' "$c_cyan" $(( i + 1 )) "$c_reset" "${labels[i]}" "$c_bold" "${values[$key]}" "$c_reset" "$source"
+        done
+        printf '\n  %s a%s  all settings    %s e%s  edit the file    %s q%s  done\n\n' "$c_cyan" "$c_reset" "$c_cyan" "$c_reset" "$c_cyan" "$c_reset"
+        ask choice 'Change which?' q
+        case "$choice" in
+            q|Q|'') return 0 ;;
+            a|A) clean_env "$self" config list; continue ;;
+            e|E) config_edit; continue ;;
+        esac
+        if [[ ! "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then continue; fi
+        key="${keys[choice - 1]}"
+        row="$(setting_row "$key")"
+        IFS='|' read -r _ type _ summary <<< "$row"
+        note "$summary"
+        note "Enter a value, '-' for the default, or nothing to keep it."
+        answer=''
+        while :; do
+            printf '%s%s%s %s[%s]%s ' "$c_bold" "${labels[choice - 1]}" "$c_reset" "$c_dim" "${values[$key]}" "$c_reset" > /dev/tty
+            IFS= read -r answer < /dev/tty || exit 130
+            [[ -n "$answer" && "$answer" != "${values[$key]}" ]] || { answer=''; break; }
+            [[ "$answer" != - ]] || break
+            validate_setting "$type" "$answer" && break
+            printf '  %sPlease enter %s.%s\n' "$c_red" "$(type_hint "$type")" "$c_reset" > /dev/tty
+        done
+        if [[ "$answer" == - ]]; then config_unset "$key"; elif [[ -n "$answer" ]]; then config_set "$key" "$answer"; fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# quiet
+
+cmd_quiet() {
+    case "${1:-status}" in
+        on) config_write QUIET on; printf '%s Quiet mode on until "buildlock quiet auto" or "off".\n' "$s_ok"; config_check_effect QUIET on ;;
+        off) config_write QUIET off; printf '%s Quiet mode off until "buildlock quiet auto" or "on".\n' "$s_ok"; config_check_effect QUIET off ;;
+        auto) config_write QUIET; printf '%s Quiet mode follows QUIET_HOURS (%s).\n' "$s_ok" "${BUILDLOCK_QUIET_HOURS:-not set}"; config_check_effect QUIET '' ;;
+        status)
+            if (( quiet_active == 1 )); then
+                printf 'Quiet mode is %son%s' "$c_yellow" "$c_reset"
+            else
+                printf 'Quiet mode is off'
+            fi
+            case "$quiet_reason" in
+                forced|forced-off) printf ' (forced by BUILDLOCK_QUIET, from %s)\n' "$(source_of QUIET)" ;;
+                hours) printf ' (inside quiet hours %s)\n' "$BUILDLOCK_QUIET_HOURS" ;;
+                outside-hours) printf ' (outside quiet hours %s)\n' "$BUILDLOCK_QUIET_HOURS" ;;
+                *) printf ' (no QUIET_HOURS, and nothing in the config switched it on; e.g. buildlock config set QUIET_HOURS 00:00-08:00)\n' ;;
+            esac
+            printf 'Limits now: heavy jobs at once %s, test workers per job %s, light jobs at once %s\n' "$slots" "$BUILDLOCK_WORKERS" "$light_slots"
+            ;;
+        -h|--help) help_quiet ;;
+        *) die_usage "quiet: expected on, off, auto or status" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# agents: teach coding agents to queue heavy commands, in each agent's own
+# global instructions file ("memory") or in the current project's files.
+
+agent_start='<!-- BUILDLOCK_START -->'
+agent_end='<!-- BUILDLOCK_END -->'
+
+# id|name|global file|project file|kind. "block" files are shared with other
+# content (a marker-fenced section); "own" rule files (buildlock.md/.mdc) are
+# written whole, which may differ per scope (Windsurf's global file is shared).
+agent_targets() {
+    local xdg="${XDG_CONFIG_HOME:-$HOME/.config}"
+    printf '%s\n' \
+        "claude|Claude Code|${CLAUDE_CONFIG_DIR:-$HOME/.claude}/CLAUDE.md|CLAUDE.md|block" \
+        "codex|Codex CLI|${CODEX_HOME:-$HOME/.codex}/AGENTS.md|AGENTS.md|block" \
+        "gemini|Gemini CLI|$HOME/.gemini/GEMINI.md|GEMINI.md|block" \
+        "opencode|opencode|$xdg/opencode/AGENTS.md|AGENTS.md|block" \
+        "qwen|Qwen Code|${QWEN_HOME:-$HOME/.qwen}/QWEN.md|QWEN.md|block" \
+        "cursor|Cursor||.cursor/rules/buildlock.mdc|own" \
+        "windsurf|Windsurf|$HOME/.codeium/windsurf/memories/global_rules.md|.windsurf/rules/buildlock.md|own" \
+        "copilot|GitHub Copilot||.github/copilot-instructions.md|block" \
+        "kiro|Kiro|$HOME/.kiro/steering/buildlock.md|.kiro/steering/buildlock.md|own" \
+        "droid|Factory Droid|$HOME/.factory/AGENTS.md|AGENTS.md|block" \
+        "pi|Pi|${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/AGENTS.md|AGENTS.md|block" \
+        "kimi|Kimi Code|${KIMI_CODE_HOME:-$HOME/.kimi-code}/AGENTS.md|AGENTS.md|block" \
+        "grok|Grok Build|${GROK_HOME:-$HOME/.grok}/rules/buildlock.md|.grok/rules/buildlock.md|own"
+}
+
+# Best effort: the agent's command or its config directory exists here.
+agent_detected() {
+    local xdg="${XDG_CONFIG_HOME:-$HOME/.config}"
+    case "$1" in
+        claude) command -v claude > /dev/null || [[ -d "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]] ;;
+        codex) command -v codex > /dev/null || [[ -d "${CODEX_HOME:-$HOME/.codex}" ]] ;;
+        gemini) command -v gemini > /dev/null || [[ -d "$HOME/.gemini" ]] ;;
+        opencode) command -v opencode > /dev/null || [[ -d "$xdg/opencode" ]] ;;
+        qwen) command -v qwen > /dev/null || [[ -d "${QWEN_HOME:-$HOME/.qwen}" ]] ;;
+        cursor) command -v cursor > /dev/null || command -v cursor-agent > /dev/null || [[ -d "$HOME/.cursor" ]] ;;
+        windsurf) command -v windsurf > /dev/null || [[ -d "$HOME/.codeium/windsurf" ]] ;;
+        copilot) command -v copilot > /dev/null || [[ -d "$HOME/.copilot" || -d "$xdg/github-copilot" ]] ;;
+        kiro) command -v kiro > /dev/null || [[ -d "$HOME/.kiro" ]] ;;
+        droid) command -v droid > /dev/null || [[ -d "$HOME/.factory" ]] ;;
+        # "pi" is too common a command name to count as the agent.
+        pi) [[ -d "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" ]] ;;
+        kimi) command -v kimi > /dev/null || [[ -d "${KIMI_CODE_HOME:-$HOME/.kimi-code}" ]] ;;
+        grok) command -v grok > /dev/null || [[ -d "${GROK_HOME:-$HOME/.grok}" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Heavy commands this project likely runs, one per line, for the project block.
+project_commands() {
+    local pm='npm run' name names=() count=0
+    if [[ -f package.json ]]; then
+        if [[ -f bun.lock || -f bun.lockb ]]; then pm='bun run'
+        elif [[ -f pnpm-lock.yaml ]]; then pm='pnpm'
+        elif [[ -f yarn.lock ]]; then pm='yarn'
+        fi
+        # Script names inside "scripts": {...}; good enough without a JSON parser.
+        mapfile -t names < <(sed -n '/"scripts"[[:space:]]*:/,/}/p' package.json \
+            | grep -oE '^[[:space:]]*"[A-Za-z0-9:_-]+"[[:space:]]*:' | sed -E 's/^[[:space:]]*"([^"]+)".*/\1/')
+        for name in "${names[@]}"; do
+            [[ "$name" =~ ^(test|tests|typecheck|type-check|tsc|check|build|lint|e2e)$ ]] || continue
+            printf '%s %s\n' "$pm" "$name"
+            count=$(( count + 1 ))
+            (( count < 6 )) || break
+        done
+    fi
+    [[ ! -f Cargo.toml ]] || printf '%s\n' 'cargo build' 'cargo test'
+    [[ ! -f go.mod ]] || printf '%s\n' 'go build ./...' 'go test ./...'
+    if [[ -f pyproject.toml || -f pytest.ini || -f setup.cfg ]] && grep -qs pytest pyproject.toml pytest.ini setup.cfg; then printf '%s\n' 'pytest'; fi
+    if [[ -f Makefile ]]; then
+        printf '%s\n' 'make'
+        grep -qE '^test:' Makefile && printf '%s\n' 'make test'
+    fi
+    [[ ! -x gradlew ]] || printf '%s\n' './gradlew build'
+    [[ ! -f pom.xml ]] || printf '%s\n' 'mvn verify'
+    return 0
+}
+
+# The instructions block, markers included. $1 = global or project.
+agent_block() {
+    local scope="$1" cmds=() cmd
+    printf '%s\n' "$agent_start"
+    if [[ "$scope" == global ]]; then
+        cat <<'EOF'
+## Heavy commands: queue them with buildlock
+
+This machine runs several coding sessions at once and shares its CPU and memory through `buildlock`. Run every full build, full type-check, full test-suite run and full lint through it:
+
+```sh
+buildlock npm test
+buildlock npx tsc --noEmit
+buildlock cargo build --release
+```
+
+buildlock waits until the machine has room, then runs the command unchanged: same output, same exit code. A queued command starts on its own, so keep working on something else instead of polling it, and never start a second copy. Don't wrap quick commands (a single test file, git, formatters), watchers or dev servers. `buildlock status` shows what is running and why a job waits. Exit code 73 means it gave up waiting after `BUILDLOCK_TIMEOUT` seconds.
+EOF
+    else
+        mapfile -t cmds < <(project_commands)
+        cat <<'EOF'
+## Heavy commands: queue them with buildlock
+
+When `buildlock` is installed (`command -v buildlock`), run this project's full builds, type-checks, test suites and lint through it, so parallel sessions on the same machine take turns instead of overloading it:
+
+```sh
+EOF
+        if (( ${#cmds[@]} > 0 )); then
+            for cmd in "${cmds[@]}"; do printf 'buildlock %s\n' "$cmd"; done
+        else
+            printf '%s\n' 'buildlock <your test, build or type-check command>'
+        fi
+        cat <<'EOF'
+```
+
+buildlock runs the command unchanged (same output and exit code) once the machine has room; a queued command starts on its own, so don't poll it or start a second copy. Don't wrap single-file checks, watchers or dev servers. Without buildlock, run the commands directly.
+EOF
+    fi
+    printf '%s\n' "$agent_end"
+}
+
+# Frontmatter of buildlock's own rule files; agent_remove deletes such a file
+# only when nothing but one of these headers and our block is left in it.
+agent_header_cursor=$'---\ndescription: Queue heavy commands (builds, type-checks, test suites) with buildlock\nalwaysApply: true\n---'
+agent_header_windsurf=$'---\ntrigger: always_on\n---'
+agent_header_kiro=$'---\ninclusion: always\n---'
+
+# The whole content of an "own" file for target $1.
+agent_own_file() {
+    local id="$1" scope="$2"
+    case "$id" in
+        cursor) printf '%s\n\n' "$agent_header_cursor" ;;
+        windsurf) [[ "$scope" == global ]] || printf '%s\n\n' "$agent_header_windsurf" ;;
+        kiro) printf '%s\n\n' "$agent_header_kiro" ;;
+    esac
+    agent_block "$scope"
+}
+
+# The file target $1 uses at scope $2, or nothing when it has none there. In a
+# project, CLAUDE.md that only imports AGENTS.md (or links to it) defers to it.
+agent_file() {
+    local id="$1" scope="$2" row global project file
+    row="$(grep "^$id|" <<< "$(agent_targets)")" || return 1
+    IFS='|' read -r _ _ global project _ <<< "$row"
+    if [[ "$scope" == global ]]; then file="$global"; else file="${project:+$PWD/$project}"; fi
+    [[ -n "$file" ]] || return 1
+    if [[ "$scope" == project && "$id" == claude && ! -e "$file" && -f "$PWD/.claude/CLAUDE.md" ]]; then
+        file="$PWD/.claude/CLAUDE.md"
+    fi
+    printf '%s' "$file"
+}
+
+# "configured", "mentioned" (buildlock appears without our markers), or "absent".
+# Finds our block in file $1, as whole lines. Sets blk_lines (the file's
+# lines), blk_begin and blk_end. Returns 0 for exactly one START line followed
+# by one END line, 1 for no markers, 2 for anything else: then nothing is
+# edited, since guessing where a damaged block ends could delete user text.
+agent_find_block() {
+    local i line starts=0 ends=0
+    blk_lines=()
+    blk_begin=-1
+    blk_end=-1
+    if [[ -f "$1" ]]; then mapfile -t blk_lines < "$1"; fi
+    for i in "${!blk_lines[@]}"; do
+        line="${blk_lines[i]%$'\r'}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ "$line" == "$agent_start" ]]; then starts=$(( starts + 1 )); blk_begin="$i"; fi
+        if [[ "$line" == "$agent_end" ]]; then ends=$(( ends + 1 )); blk_end="$i"; fi
+    done
+    if (( starts == 0 && ends == 0 )); then return 1; fi
+    if (( starts == 1 && ends == 1 && blk_begin < blk_end )); then return 0; fi
+    return 2
+}
+
+# "configured", "broken" (damaged markers), "mentioned" (buildlock appears
+# without our markers), or "absent".
+agent_state() {
+    local file="$1" rc=0
+    [[ -f "$file" ]] || { printf absent; return 0; }
+    agent_find_block "$file" || rc=$?
+    case "$rc" in
+        0) printf configured ;;
+        2) printf broken ;;
+        *) if grep -qi -- buildlock "$file"; then printf mentioned; else printf absent; fi ;;
+    esac
+}
+
+is_own_file() { [[ "${1##*/}" == buildlock.md || "${1##*/}" == buildlock.mdc ]]; }
+
+# Writes the block for target $1 at scope $2 into file $3; prints created,
+# updated, unchanged or broken.
+agent_write() {
+    local id="$1" scope="$2" file="$3" new rc=0 lines=() block=() i action=updated
+    if is_own_file "$file"; then
+        new="$(agent_own_file "$id" "$scope")"
+    else
+        mapfile -t block < <(agent_block "$scope")
+        agent_find_block "$file" || rc=$?
+        if (( rc == 2 )); then printf broken; return 0; fi
+        if (( rc == 0 )); then
+            lines=("${blk_lines[@]:0:blk_begin}" "${block[@]}" "${blk_lines[@]:blk_end+1}")
+        else
+            lines=("${blk_lines[@]}")
+            # Drop trailing blank lines, then one blank line before the block.
+            while (( ${#lines[@]} > 0 )) && [[ -z "${lines[-1]//[[:space:]]/}" ]]; do unset 'lines[-1]'; done
+            if (( ${#lines[@]} > 0 )); then lines+=(''); fi
+            lines+=("${block[@]}")
+        fi
+        new="$(printf '%s\n' "${lines[@]}")"
+    fi
+    [[ -e "$file" ]] || action=created
+    if [[ -f "$file" && "$(< "$file")" == "$new" ]]; then printf unchanged; return 0; fi
+    printf '%s\n' "$new" | write_atomic "$file"
+    printf '%s' "$action"
+}
+
+# Removes our block from file $1; prints removed, not-found or broken. Our own
+# rule file goes away when only its header is left; another file goes away
+# only when nothing at all is left (a symlink is emptied, never followed by rm).
+agent_remove() {
+    local file="$1" rc=0 before=() after=() rest header
+    [[ -f "$file" ]] || { printf not-found; return 0; }
+    agent_find_block "$file" || rc=$?
+    if (( rc == 1 )); then printf not-found; return 0; fi
+    if (( rc == 2 )); then printf broken; return 0; fi
+    before=("${blk_lines[@]:0:blk_begin}")
+    after=("${blk_lines[@]:blk_end+1}")
+    while (( ${#before[@]} > 0 )) && [[ -z "${before[-1]//[[:space:]]/}" ]]; do unset 'before[-1]'; done
+    while (( ${#after[@]} > 0 )) && [[ -z "${after[0]//[[:space:]]/}" ]]; do after=("${after[@]:1}"); done
+    if is_own_file "$file" && (( ${#after[@]} == 0 )); then
+        header="$(printf '%s\n' "${before[@]}")"
+        (( ${#before[@]} > 0 )) || header=''
+        if [[ -z "$header" || "$header" == "$agent_header_cursor" || "$header" == "$agent_header_windsurf" || "$header" == "$agent_header_kiro" ]]; then
+            rm -f -- "$file"
+            printf removed
+            return 0
+        fi
+    fi
+    if (( ${#before[@]} > 0 && ${#after[@]} > 0 )); then before+=(''); fi
+    rest="$(printf '%s\n' "${before[@]}" "${after[@]}")"
+    if [[ -z "${rest//[[:space:]]/}" ]]; then
+        if [[ -L "$file" ]]; then : | write_atomic "$file"; else rm -f -- "$file"; fi
+    else
+        printf '%s\n' "$rest" | write_atomic "$file"
+    fi
+    printf removed
+}
+
+# Claude Code: auto-allow buildlock's read-only subcommands. Never
+# `Bash(buildlock:*)`: that would let any wrapped command skip the prompt.
+claude_permissions() {
+    local action="$1" file="$2"
+    command -v python3 > /dev/null || { printf 'skipped (python3 not found)'; return 0; }
+    python3 -I - "$action" "$file" <<'PY' || printf 'skipped (python3 failed)'
+import json, os, sys, tempfile
+action, path = sys.argv[1], sys.argv[2]
+rules = ["Bash(buildlock status:*)", "Bash(buildlock --status)", "Bash(buildlock explain:*)",
+         "Bash(buildlock --explain:*)", "Bash(buildlock history:*)", "Bash(buildlock stats:*)"]
+real = os.path.realpath(path)
+
+def done(word):
+    print(word, end="")
+    sys.exit(0)
+
+try:
+    with open(real, encoding="utf-8") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    if action == "remove":
+        done("not-found")
+    data = {}
+except (OSError, ValueError):
+    done("skipped (could not parse %s)" % path)
+if not isinstance(data, dict):
+    done("skipped (%s is not a JSON object)" % path)
+perms = data.get("permissions")
+if perms is None:
+    perms = {}
+if not isinstance(perms, dict) or not isinstance(perms.get("allow", []), list):
+    done("skipped (unexpected permissions in %s)" % path)
+allow = perms.get("allow") or []
+if action == "add":
+    missing = [r for r in rules if r not in allow]
+    if not missing:
+        done("unchanged")
+    perms["allow"] = allow + missing
+    data["permissions"] = perms
+    result = "updated"
+else:
+    kept = [r for r in allow if r not in rules]
+    if len(kept) == len(allow):
+        done("not-found")
+    if kept:
+        perms["allow"] = kept
+    else:
+        perms.pop("allow", None)
+    if perms:
+        data["permissions"] = perms
+    else:
+        data.pop("permissions", None)
+    result = "removed"
+if result == "removed" and not data:
+    # Nothing but what install added: the file goes, as install created it.
+    os.remove(real)
+    done(result)
+os.makedirs(os.path.dirname(real), exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".buildlock.")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+if os.path.exists(real):
+    os.chmod(tmp, os.stat(real).st_mode & 0o777)
+os.replace(tmp, real)
+done(result)
+PY
+}
+
+claude_settings_file() {
+    if [[ "$1" == global ]]; then printf '%s/settings.json' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; else printf '%s/.claude/settings.local.json' "$PWD"; fi
+}
+
+cmd_agents() {
+    local sub="${1:-}"
+    [[ $# -eq 0 ]] || shift
+    case "$sub" in
+        ''|install|add) agents_install "$@" ;;
+        uninstall|remove) agents_uninstall "$@" ;;
+        status|list) agents_status "$@" ;;
+        print|show) agents_print "$@" ;;
+        -h|--help|help) help_agents ;;
+        *) die_usage "agents: unknown subcommand '$sub' (install, uninstall, status, print)" ;;
+    esac
+}
+
+# Parses the shared agents options into globals: scope, target_list, yes, dry_run, force, permissions.
+agents_options() {
+    scope=global target_list='' yes=0 dry_run=0 force=0 permissions=1
+    while (( $# > 0 )); do
+        case "$1" in
+            --global) scope=global ;;
+            --project|--local) scope=project ;;
+            --location=global) scope=global ;;
+            --location=local|--location=project) scope=project ;;
+            --target|-t) need_value "$@"; target_list="$2"; shift ;;
+            --target=*) target_list="${1#*=}" ;;
+            -y|--yes) yes=1 ;;
+            --dry-run|-n) dry_run=1 ;;
+            --force) force=1 ;;
+            --no-permissions) permissions=0 ;;
+            -h|--help) help_agents; exit 0 ;;
+            *) die_usage "agents: unknown option '$1'" ;;
+        esac
+        shift
+    done
+}
+
+# Prints the target ids chosen by --target (auto, all, none or a list).
+agents_resolve_targets() {
+    local list="$1" id ids=() known
+    known="$(cut -d'|' -f1 <<< "$(agent_targets)")"
+    case "$list" in
+        all) printf '%s\n' "$known" ;;
+        none) return 0 ;;
+        auto|'') for id in $known; do if agent_detected "$id"; then printf '%s\n' "$id"; fi; done ;;
+        *)
+            IFS=',' read -r -a ids <<< "${list// /}"
+            for id in "${ids[@]}"; do
+                grep -qx -- "$id" <<< "$known" || die "unknown agent '$id' (known: $(tr '\n' ' ' <<< "$known"))"
+                printf '%s\n' "$id"
+            done
+            ;;
+    esac
+}
+
+agents_status() {
+    local scope_list=(global project) id name file state det sc
+    printf '%sbuildlock agents%s %s instructions that teach coding agents to queue heavy commands\n' "$c_bold" "$c_reset" "$s_dot"
+    for sc in "${scope_list[@]}"; do
+        if [[ "$sc" == global ]]; then heading "Global (every project on this machine)"; else heading "This project ($(short_path "$PWD" 50))"; fi
+        while IFS='|' read -r id name _ _ _; do
+            det=0
+            if agent_detected "$id"; then det=1; fi
+            file="$(agent_file "$id" "$sc")" || continue
+            [[ "$sc" == project || "$det" == 1 ]] || continue
+            state="$(agent_state "$file")"
+            case "$state" in
+                configured) ok "$(printf '%-15s %s' "$name" "$(short_path "$file" 60)")" ;;
+                mentioned) warn "$(printf '%-15s %s %s(mentions buildlock without our block)%s' "$name" "$(short_path "$file" 60)" "$c_dim" "$c_reset")" ;;
+                *) [[ "$sc" == global ]] && note "$(printf '  %-15s %s (not set up)' "$name" "$(short_path "$file" 60)")" ;;
+            esac
+        done < <(agent_targets)
+    done
+    printf '\n'
+    note "Set up: buildlock agents install [--project] · remove: buildlock agents uninstall [--project]"
+    return 0
+}
+
+agents_print() {
+    local scope target_list yes dry_run force permissions
+    agents_options "$@"
+    agent_block "$scope"
+}
+
+agents_install() {
+    local scope target_list yes dry_run force permissions id name file state action
+    local candidates=() chosen=() picks i answer real
+    declare -A handled=()
+    agents_options "$@"
+    if [[ -z "$target_list" && "$yes" == 0 ]] && have_tty; then
+        # Interactive: list the targets, preselect detected ones.
+        printf '%sTeach coding agents to use buildlock%s %s %s\n\n' "$c_bold" "$c_reset" "$s_dot" \
+            "$([[ "$scope" == global ]] && printf 'global instructions (every project)' || printf 'this project: %s' "$(short_path "$PWD" 50)")"
+        i=0
+        while IFS='|' read -r id name _ _ _; do
+            file="$(agent_file "$id" "$scope")" || continue
+            i=$(( i + 1 ))
+            candidates+=("$id")
+            state="$(agent_state "$file")"
+            local mark=' '
+            if agent_detected "$id" && [[ "$state" != mentioned && "$state" != broken ]]; then mark='x'; chosen+=("$i"); fi
+            printf '  %s%2d%s [%s] %-15s %s%s%s\n' "$c_cyan" "$i" "$c_reset" "$mark" "$name" "$c_dim" \
+                "$(short_path "$file" 50)$([[ "$state" == configured ]] && printf ' (set up)')$([[ "$state" == mentioned ]] && printf ' (already mentions buildlock)')$([[ "$state" == broken ]] && printf ' (damaged markers)')" "$c_reset"
+        done < <(agent_targets)
+        printf '\n'
+        ask picks 'Which ones? (numbers, a = all, n = none)' "$(IFS=,; printf '%s' "${chosen[*]:-n}")"
+        target_list=''
+        case "$picks" in
+            n|N|none) printf 'Nothing changed.\n'; return 0 ;;
+            a|A|all) target_list="$(IFS=,; printf '%s' "${candidates[*]}")" ;;
+            *)
+                IFS=', ' read -r -a chosen <<< "$picks"
+                for answer in "${chosen[@]}"; do
+                    [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#candidates[@]} )) || die "not a choice: $answer"
+                    target_list+="${target_list:+,}${candidates[answer - 1]}"
+                done
+                ;;
+        esac
+    fi
+    [[ -n "$target_list" ]] || target_list=auto
+    # Resolved before anything is written, so an unknown name stops the whole run.
+    picks="$(agents_resolve_targets "$target_list")" || exit 1
+    chosen=()
+    [[ -z "$picks" ]] || mapfile -t chosen <<< "$picks"
+    if (( ${#chosen[@]} == 0 )); then
+        printf 'No coding agents found. Pick some with --target (e.g. --target claude,codex) or --target all.\n'
+        return 0
+    fi
+    for id in "${chosen[@]}"; do
+        name="$(grep "^$id|" <<< "$(agent_targets)" | cut -d'|' -f2)"
+        if ! file="$(agent_file "$id" "$scope")"; then
+            note "$(printf '  %-15s no %s instructions file; use --%s' "$name" "$scope" "$([[ "$scope" == global ]] && printf project || printf global)")"
+            continue
+        fi
+        # A project CLAUDE.md that only imports AGENTS.md gets the block through it.
+        if [[ "$scope" == project && "$id" == claude && -f "$file" ]] && grep -qE '^@AGENTS\.md[[:space:]]*$' "$file"; then
+            file="$PWD/AGENTS.md"
+        fi
+        # Several agents share AGENTS.md (or a symlinked CLAUDE.md): handle each real file once.
+        real="$(readlink -m -- "$file")"
+        if [[ -n "${handled[$real]+set}" ]]; then
+            note "$(printf '  %-15s %s (same file as %s)' "$name" "$(short_path "$file" 60)" "${handled[$real]}")"
+            continue
+        fi
+        handled[$real]="$name"
+        state="$(agent_state "$file")"
+        if [[ "$state" == broken ]]; then
+            warn "$(printf '%-15s %s %s(its BUILDLOCK_START/END markers are damaged; fix or remove them by hand)%s' "$name" "$(short_path "$file" 60)" "$c_dim" "$c_reset")"
+            continue
+        fi
+        if [[ "$state" == mentioned && "$force" == 0 ]]; then
+            warn "$(printf '%-15s %s %s(already mentions buildlock; kept as is, --force adds the block)%s' "$name" "$(short_path "$file" 60)" "$c_dim" "$c_reset")"
+            continue
+        fi
+        if (( dry_run == 1 )); then
+            note "$(printf '  %-15s would write %s' "$name" "$(short_path "$file" 60)")"
+            continue
+        fi
+        action="$(agent_write "$id" "$scope" "$file")"
+        ok "$(printf '%-15s %s %s(%s)%s' "$name" "$(short_path "$file" 60)" "$c_dim" "$action" "$c_reset")"
+        if [[ "$id" == claude && "$permissions" == 1 ]]; then
+            action="$(claude_permissions add "$(claude_settings_file "$scope")")" || action=skipped
+            note "$(printf '  %-15s %s: allow buildlock status/explain/history/stats (%s)' '' "$(short_path "$(claude_settings_file "$scope")" 50)" "$action")"
+        fi
+    done
+    if (( dry_run == 0 )); then
+        note "Agents read these files when a session starts: restart running sessions to pick them up."
+        if [[ "$scope" == project ]]; then note "Commit the changed files so everyone working on this project gets them."; fi
+    fi
+    return 0
+}
+
+agents_uninstall() {
+    local scope target_list yes dry_run force permissions id name file action sc scopes=() ids picks=() files=() f real
+    declare -A handled=()
+    agents_options "$@"
+    # Without an explicit scope flag, clean both: the global files and this project's.
+    if [[ " $* " == *" --global "* || " $* " == *" --location=global "* ]]; then scopes=(global)
+    elif [[ "$scope" == project ]]; then scopes=(project)
+    else scopes=(global project)
+    fi
+    [[ -n "$target_list" ]] || target_list=all
+    ids="$(agents_resolve_targets "$target_list")" || exit 1
+    [[ -z "$ids" ]] || mapfile -t picks <<< "$ids"
+    for sc in "${scopes[@]}"; do
+        for id in "${picks[@]}"; do
+            name="$(grep "^$id|" <<< "$(agent_targets)" | cut -d'|' -f2)"
+            file="$(agent_file "$id" "$sc")" || continue
+            files=("$file")
+            # The same redirect as install: a project CLAUDE.md importing AGENTS.md got the block there.
+            if [[ "$sc" == project && "$id" == claude && -f "$file" ]] && grep -qE '^@AGENTS\.md[[:space:]]*$' "$file"; then
+                files+=("$PWD/AGENTS.md")
+            fi
+            for f in "${files[@]}"; do
+                real="$(readlink -m -- "$f")"
+                [[ -z "${handled[$real]+set}" ]] || continue
+                handled[$real]=1
+                if (( dry_run == 1 )); then
+                    [[ "$(agent_state "$f")" != configured ]] || note "$(printf '  %-15s would clean %s' "$name" "$(short_path "$f" 60)")"
+                    continue
+                fi
+                action="$(agent_remove "$f")"
+                case "$action" in
+                    removed) ok "$(printf '%-15s %s %s(removed)%s' "$name" "$(short_path "$f" 60)" "$c_dim" "$c_reset")" ;;
+                    broken) warn "$(printf '%-15s %s %s(damaged BUILDLOCK markers; left as is)%s' "$name" "$(short_path "$f" 60)" "$c_dim" "$c_reset")" ;;
+                esac
+            done
+            if [[ "$id" == claude && "$dry_run" == 0 ]]; then
+                action="$(claude_permissions remove "$(claude_settings_file "$sc")")" || action=skipped
+                [[ "$action" != removed ]] || ok "$(printf '%-15s %s %s(permissions removed)%s' "$name" "$(short_path "$(claude_settings_file "$sc")" 60)" "$c_dim" "$c_reset")"
+            fi
+        done
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# setup, doctor, update, uninstall
+
+cmd_setup() {
+    local ram psi=no def_slots workers slots_ans light reserve want_quiet hours q_slots q_workers q_light suggested_reserve
+    have_tty || die "setup is interactive; without a terminal use: buildlock config set KEY VALUE"
+    # Defaults are the normal (not quiet-hours) values, even when setup runs at night.
+    local key value source summary
+    declare -A base=() base_src=()
+    while IFS=$'\t' read -r key value source summary; do base[$key]="$value"; base_src[$key]="$source"; done \
+        < <(clean_env BUILDLOCK_QUIET=off "$(self_path)" config list --tsv)
+    ram="$(total_ram_mb)"
+    [[ ! -r "$proc_root/pressure/cpu" ]] || psi=yes
+    printf '%sbuildlock setup%s\n' "$c_bold" "$c_reset"
+    note "This machine: $cores cores, $(fmt_mb "$ram") RAM, pressure stall information: $psi"
+    note "Press Enter to keep the value in brackets. Change anything later with: buildlock config"
+
+    heading "1/4  How much may run at once"
+    note "A heavy job is a full build, type-check or test suite. Each one is assumed to keep"
+    note "WORKERS cores busy, so the default is cores / WORKERS jobs."
+    ask workers 'Test workers per heavy job' "${base[WORKERS]}" int
+    (( 10#$workers > 0 )) || workers=1
+    def_slots=$(( cores / workers > 1 ? cores / workers : 1 ))
+    [[ "${base_src[SLOTS]}" != config ]] || def_slots="${base[SLOTS]}"
+    ask slots_ans 'Heavy jobs at once' "$def_slots" int
+    (( 10#$slots_ans > 0 )) || slots_ans=1
+    ask light 'Light jobs at once (quick checks)' "${base[LIGHT_SLOTS]}" int
+
+    heading "2/4  Memory"
+    suggested_reserve="${base[RESERVE_MEMORY_MB]}"
+    if [[ "${base_src[RESERVE_MEMORY_MB]}" == default ]] && (( ram > 0 && ram < 32768 )); then
+        suggested_reserve=$(( ram / 10 > 1024 ? ram / 10 : 1024 ))
+    fi
+    note "No new job starts unless this much memory stays free after it, counting what"
+    note "jobs that just started may still grow into."
+    ask reserve 'Memory to keep free (MB)' "$suggested_reserve" int
+
+    heading "3/4  Quiet hours"
+    note "Run fewer jobs at certain times, e.g. at night when a busy machine is loud."
+    if confirm 'Set up quiet hours?' "$([[ -n "${BUILDLOCK_QUIET_HOURS:-}" ]] && printf y || printf n)"; then
+        want_quiet=1
+        ask hours 'Quiet hours' "${BUILDLOCK_QUIET_HOURS:-00:00-08:00}" hours
+        ask q_slots 'Heavy jobs at once during quiet hours' "${BUILDLOCK_QUIET_SLOTS:-1}" int
+        ask q_workers 'Test workers per job during quiet hours' "${BUILDLOCK_QUIET_WORKERS:-$(( workers / 2 > 0 ? workers / 2 : 1 ))}" int
+        ask q_light 'Light jobs at once during quiet hours' "${BUILDLOCK_QUIET_LIGHT_SLOTS:-2}" int
+    else
+        want_quiet=0
+    fi
+
+    heading "Saving to $(short_path "$config_file" 60)"
+    # Values equal to the computed defaults stay unset, so they keep following the machine.
+    if (( 10#$workers == 8 )); then config_write WORKERS; else config_write WORKERS "$workers"; fi
+    if (( 10#$slots_ans == (cores / workers > 1 ? cores / workers : 1) )); then
+        config_write SLOTS
+        config_write MAX_JOBS
+    else
+        config_write SLOTS "$slots_ans"
+        # An explicit SLOTS pins the idle cap to it; keep the idle headroom.
+        config_write MAX_JOBS "$(( slots_ans > cores / 4 ? slots_ans : (cores / 4 > 0 ? cores / 4 : 1) ))"
+    fi
+    if (( 10#$light == (cores / 4 > 1 ? cores / 4 : 1) )); then config_write LIGHT_SLOTS; else config_write LIGHT_SLOTS "$light"; fi
+    if (( 10#$reserve == 6144 )); then config_write RESERVE_MEMORY_MB; else config_write RESERVE_MEMORY_MB "$reserve"; fi
+    if (( want_quiet == 1 )); then
+        config_write QUIET_HOURS "$hours"
+        config_write QUIET_SLOTS "$q_slots"
+        config_write QUIET_WORKERS "$q_workers"
+        config_write QUIET_LIGHT_SLOTS "$q_light"
+    else
+        config_write QUIET_HOURS
+        config_write QUIET_SLOTS
+        config_write QUIET_WORKERS
+        config_write QUIET_LIGHT_SLOTS
+    fi
+    ok "Settings saved"
+
+    heading "4/4  Coding agents"
+    note "Claude Code, Codex, Gemini CLI and others can learn to wrap heavy commands in buildlock"
+    note "through their global instructions files."
+    if confirm 'Add buildlock instructions to your coding agents?' y; then
+        printf '\n'
+        agents_install --global
+    fi
+
+    heading "Done"
+    printf '  Try it:   %sbuildlock npm test%s   (or any build / test / type-check command)\n' "$c_cyan" "$c_reset"
+    printf '  Watch:    %sbuildlock status --watch%s\n' "$c_cyan" "$c_reset"
+    printf '  Check:    %sbuildlock doctor%s\n' "$c_cyan" "$c_reset"
+}
+
+cmd_doctor() {
+    local failures=0 cmd self path_hits=() file count stale=0 log_lines=0 files=() id name
+    [[ "${1:-}" != -h && "${1:-}" != --help ]] || { help_doctor; return 0; }
+    printf '%sbuildlock doctor%s %s %s\n' "$c_bold" "$c_reset" "$s_dot" "$bl_version"
+    heading "Requirements"
+    if [[ "$(uname -s)" == Linux ]]; then ok "Linux $(uname -r)"; else fail "$(uname -s): buildlock needs Linux (or WSL 2)"; failures=$(( failures + 1 )); fi
+    if (( BASH_VERSINFO[0] >= 5 )); then ok "bash $BASH_VERSION"; else fail "bash $BASH_VERSION: needs bash 5 or newer"; failures=$(( failures + 1 )); fi
+    local missing=()
+    for cmd in flock setsid ps awk date nproc mktemp; do command -v "$cmd" > /dev/null || missing+=("$cmd"); done
+    if (( ${#missing[@]} == 0 )); then ok "flock, setsid, ps, awk, date, nproc, mktemp"
+    else fail "not found: ${missing[*]} (util-linux / procps / coreutils)"; failures=$(( failures + 1 )); fi
+    if command -v setsid > /dev/null && ! setsid --help 2>&1 | grep -q -- --wait; then fail "setsid has no --wait (needs util-linux 2.31+)"; failures=$(( failures + 1 )); fi
+    if ps -e -o pid=,ppid=,rss= > /dev/null 2>&1; then ok "ps reports memory per process"; else fail "ps -o rss= failed (needs procps)"; failures=$(( failures + 1 )); fi
+    if date -u -d @0 +%Y > /dev/null 2>&1; then ok "GNU date"; else fail "date -d @N failed (needs GNU coreutils)"; failures=$(( failures + 1 )); fi
+    if [[ -r "$proc_root/loadavg" && -r "$proc_root/meminfo" ]]; then ok "/proc load and memory"; else fail "/proc/loadavg or /proc/meminfo unreadable"; failures=$(( failures + 1 )); fi
+    if [[ -r "$proc_root/pressure/cpu" ]]; then ok "pressure stall information (/proc/pressure)"; else warn "no /proc/pressure: buildlock admits on load and memory only"; fi
+
+    heading "This installation"
+    self="$(self_path)"
+    ok "running $(short_path "$self" 70)"
+    mapfile -t path_hits < <(type -a -P buildlock 2>/dev/null | awk '!seen[$0]++')
+    if (( ${#path_hits[@]} == 0 )); then
+        warn "buildlock is not on PATH; add $(short_path "$(dirname "$self")" 50) to PATH"
+    elif [[ "$(readlink -f "${path_hits[0]}")" != "$self" ]]; then
+        warn "PATH finds $(short_path "${path_hits[0]}" 60) first, not this copy"
+    else
+        ok "on PATH"
+    fi
+    (( ${#path_hits[@]} <= 1 )) || warn "${#path_hits[@]} copies on PATH: ${path_hits[*]}"
+    if [[ -z "$config_file" ]]; then
+        note "  config disabled (BUILDLOCK_CONFIG is empty)"
+    elif [[ ! -f "$config_file" ]]; then
+        ok "no config file (defaults); create one with buildlock setup"
+    elif bash -n "$config_file" 2>/dev/null; then
+        ok "config $(short_path "$config_file" 60)"
+    else
+        fail "config $(short_path "$config_file" 60) has a syntax error:"
+        bash -n "$config_file" 2>&1 | sed 's/^/      /'
+        failures=$(( failures + 1 ))
+    fi
+    if mkdir -p "$(dirname "$lock_path")" 2>/dev/null && [[ -w "$(dirname "$lock_path")" ]]; then ok "lock files in $(short_path "$(dirname "$lock_path")" 60)"; else fail "cannot write $(dirname "$lock_path")"; failures=$(( failures + 1 )); fi
+    mapfile -t files < <(log_files all)
+    for file in "${files[@]}"; do count="$(wc -l < "$file")"; log_lines=$(( log_lines + count )); done
+    ok "job log $(short_path "$job_log_dir" 50): $log_lines jobs in ${#files[@]} month file(s)"
+    for file in "$queue_dir"/*; do is_buildlock_pid "${file##*/}" || stale=$(( stale + 1 )); done
+    (( stale == 0 )) || note "  $stale stale queue file(s); the next waiter cleans them up"
+    if (( quiet_active == 1 )); then note "  $(quiet_summary): limits are lower right now"; fi
+
+    heading "Coding agents"
+    local knows=() unset_agents=() project_only=()
+    while IFS='|' read -r id name _ _ _; do
+        agent_detected "$id" || continue
+        if ! file="$(agent_file "$id" global)"; then project_only+=("$name"); continue; fi
+        case "$(agent_state "$file")" in
+            configured|mentioned) knows+=("$name") ;;
+            *) unset_agents+=("$name") ;;
+        esac
+    done < <(agent_targets)
+    (( ${#knows[@]} == 0 )) || ok "know buildlock: $(join_by ', ' "${knows[@]}")"
+    (( ${#unset_agents[@]} == 0 )) || warn "not set up: $(join_by ', ' "${unset_agents[@]}") (buildlock agents install)"
+    (( ${#project_only[@]} == 0 )) || note "  per-project rules only: $(join_by ', ' "${project_only[@]}") (buildlock agents install --project)"
+    (( ${#knows[@]} + ${#unset_agents[@]} + ${#project_only[@]} > 0 )) || note "  no coding agents detected"
+
+    printf '\n'
+    if (( failures > 0 )); then printf '%s%d problem(s) found.%s\n' "$c_red" "$failures" "$c_reset"; return 1; fi
+    printf '%sAll good.%s\n' "$c_green" "$c_reset"
+}
+
+# Downloads URL $1 to file $2.
+fetch() {
+    if command -v curl > /dev/null; then curl -fsSL --retry 2 -o "$2" "$1"
+    elif command -v wget > /dev/null; then wget -q -O "$2" "$1"
+    else die "needs curl or wget to download"
+    fi
+}
+
+cmd_update() {
+    local check=0 version=latest force=0 base self dir tmp sum new_version
+    while (( $# > 0 )); do
+        case "$1" in
+            --check) check=1 ;;
+            --force) force=1 ;;
+            --version) need_value "$@"; version="$2"; shift ;;
+            --version=*) version="${1#*=}" ;;
+            v[0-9]*) version="$1" ;;
+            -h|--help) help_update; return 0 ;;
+            *) die_usage "update: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    base="${BUILDLOCK_RELEASES_URL:-$bl_home/releases}"
+    if [[ "$version" == latest ]]; then base+=/latest/download; else base+="/download/$version"; fi
+    self="$(invoked_path)"
+    if [[ -L "$self" ]]; then
+        die "$self is a symlink to $(readlink -f "$self"); update that copy instead (e.g. git pull)"
+    fi
+    dir="$(dirname "$self")"
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064 # expand now: $tmp is local and gone by exit time.
+    trap "rm -rf '$tmp'" EXIT
+    printf 'Checking %s %s\n' "$version" "$c_dim$base$c_reset"
+    fetch "$base/buildlock" "$tmp/buildlock" || die "download failed: $base/buildlock"
+    fetch "$base/buildlock.sha256" "$tmp/buildlock.sha256" || die "checksum download failed: $base/buildlock.sha256; not installed"
+    sum="$(cut -d' ' -f1 < "$tmp/buildlock.sha256")"
+    [[ "$(sha256sum "$tmp/buildlock" | cut -d' ' -f1)" == "$sum" ]] || die "checksum mismatch; not installed"
+    bash -n "$tmp/buildlock" || die "downloaded file is not a valid script; not installed"
+    new_version="$(sed -n 's/^bl_version=//p' "$tmp/buildlock" | head -n1)"
+    [[ -n "$new_version" ]] || die "downloaded file has no version; not installed"
+    if [[ "$new_version" == "$bl_version" && "$force" == 0 ]]; then
+        printf '%s buildlock %s is up to date\n' "$s_ok" "$bl_version"
+        return 0
+    fi
+    if (( check == 1 )); then
+        printf 'Update available: %s -> %s (run: buildlock update)\n' "$bl_version" "$new_version"
+        return 0
+    fi
+    [[ -w "$dir" ]] || die "cannot write $dir; rerun with permission to replace $self"
+    # Rename over the old file: running instances keep reading their copy.
+    install -m 755 "$tmp/buildlock" "$dir/.buildlock.new.$$"
+    mv -f "$dir/.buildlock.new.$$" "$self"
+    printf '%s Updated buildlock %s -> %s\n' "$s_ok" "$bl_version" "$new_version"
+    note "Changes: $bl_home/blob/main/CHANGELOG.md"
+}
+
+cmd_uninstall() {
+    local yes=0 purge=0 keep_agents=0 self holders queued
+    while (( $# > 0 )); do
+        case "$1" in
+            -y|--yes) yes=1 ;;
+            --purge) purge=1 ;;
+            --keep-agents) keep_agents=1 ;;
+            -h|--help) help_uninstall; return 0 ;;
+            *) die_usage "uninstall: unknown option '$1'" ;;
+        esac
+        shift
+    done
+    self="$(invoked_path)"
+    [[ "${self##*/}" == *buildlock* ]] || die "refusing to remove $self"
+    printf '%sThis removes:%s\n' "$c_bold" "$c_reset"
+    printf '  %s\n' "$(short_path "$self" 70)"
+    (( keep_agents == 1 )) || printf '  buildlock instructions in your coding agents'"'"' global files and in %s\n' "$(short_path "$PWD" 40)"
+    if (( purge == 1 )); then
+        printf '  %s (config)\n  %s/jobs-*.jsonl (job log)\n  lock files %s*\n' "$(short_path "$config_file" 60)" "$(short_path "$job_log_dir" 60)" "$(short_path "$lock_path" 60)"
+    fi
+    if (( yes == 0 )); then
+        have_tty || die "uninstall needs --yes without a terminal"
+        confirm 'Continue?' n || { printf 'Nothing removed.\n'; return 0; }
+    fi
+    (( keep_agents == 1 )) || agents_uninstall
+    if (( purge == 1 )); then
+        holders="$(live_holders)"
+        queued="$(queue_entries)"
+        if [[ -n "$holders$queued" ]]; then
+            warn "jobs are running or queued; lock files kept"
+        else
+            rm -rf -- "$queue_dir"
+            rm -f -- "$lock_path" "$lock_path".* 2>/dev/null || true
+        fi
+        # Only buildlock's own files: either directory may be shared with other tools.
+        if [[ -n "$config_file" ]]; then
+            rm -f -- "$config_file"
+            rmdir -- "$(dirname "$config_file")" 2>/dev/null || true
+        fi
+        rm -f -- "$job_log_dir"/jobs-*.jsonl
+        rmdir -- "$job_log_dir" 2>/dev/null || true
+        ok "config, job log and lock files removed"
+    fi
+    if [[ -L "$self" ]]; then
+        local link_target
+        link_target="$(readlink -f "$self" 2>/dev/null || true)"
+        rm -f -- "$self"
+        ok "removed the link $(short_path "$self" 60); its target $(short_path "$link_target" 60) is left as is"
+    else
+        rm -f -- "$self"
+        ok "removed $(short_path "$self" 70)"
+    fi
+    (( purge == 1 )) || note "The config and job log stay (--purge removes them)."
+    note "Reinstall: curl -fsSL https://raw.githubusercontent.com/$bl_repo/main/install.sh | bash"
+}
+
+# ---------------------------------------------------------------------------
+# completion
+
+cmd_completion() {
+    case "${1:-}" in
+        bash) cat <<'EOF'
+# buildlock bash completion: eval "$(buildlock completion bash)"
+_buildlock() {
+    local cur="${COMP_WORDS[COMP_CWORD]}" sub="${COMP_WORDS[1]:-}"
+    local cmds="run status explain history stats config quiet agents setup doctor update uninstall completion help version"
+    if (( COMP_CWORD == 1 )); then
+        mapfile -t COMPREPLY < <(compgen -W "$cmds" -- "$cur"; compgen -c -- "$cur")
+        return
+    fi
+    case "$sub" in
+        status) mapfile -t COMPREPLY < <(compgen -W "--json --watch --interval" -- "$cur") ;;
+        history) mapfile -t COMPREPLY < <(compgen -W "-n --here --failed --all --json" -- "$cur") ;;
+        stats) mapfile -t COMPREPLY < <(compgen -W "--days --here -n" -- "$cur") ;;
+        quiet) mapfile -t COMPREPLY < <(compgen -W "on off auto status" -- "$cur") ;;
+        completion) mapfile -t COMPREPLY < <(compgen -W "bash zsh" -- "$cur") ;;
+        agents) if (( COMP_CWORD == 2 )); then mapfile -t COMPREPLY < <(compgen -W "install uninstall status print" -- "$cur");
+                else mapfile -t COMPREPLY < <(compgen -W "--global --project --target --yes --dry-run --force --no-permissions" -- "$cur"); fi ;;
+        config) if (( COMP_CWORD == 2 )); then mapfile -t COMPREPLY < <(compgen -W "list get set unset edit path" -- "$cur");
+                elif (( COMP_CWORD == 3 )); then mapfile -t COMPREPLY < <(compgen -W "$(buildlock config list --tsv 2>/dev/null | cut -f1)" -- "$cur"); fi ;;
+        run|explain) if declare -F _command_offset > /dev/null; then _command_offset 2; fi ;;
+        setup|doctor|update|uninstall|help|version) ;;
+        *) if declare -F _command_offset > /dev/null; then _command_offset 1; fi ;;
+    esac
+}
+complete -F _buildlock buildlock
+EOF
+            ;;
+        zsh) cat <<'EOF'
+# buildlock zsh completion: source <(buildlock completion zsh)   (after compinit)
+_buildlock() {
+    local -a subcmds
+    subcmds=(
+        'run:run a command once the machine has room'
+        'status:running and queued jobs'
+        'explain:how a command would be scheduled'
+        'history:recent jobs'
+        'stats:run time, memory and waiting per command'
+        'config:view and change settings'
+        'quiet:quiet mode on, off or auto'
+        'agents:teach coding agents to use buildlock'
+        'setup:guided setup'
+        'doctor:check requirements'
+        'update:install the latest release'
+        'uninstall:remove buildlock'
+        'completion:shell completion script'
+    )
+    if (( CURRENT == 2 )); then
+        _describe -t subcommands 'buildlock command' subcmds
+        _command_names -e
+        return
+    fi
+    case $words[2] in
+        status) _arguments '--json[machine-readable output]' '(-w --watch)'{-w,--watch}'[refresh until Ctrl-C]' '--interval[seconds between refreshes]:seconds' ;;
+        history) _arguments '-n[number of jobs]:count' '--here[this repository only]' '--failed[failed jobs only]' '--all[every month]' '--json[raw job-log lines]' ;;
+        stats) _arguments '--days[window]:days' '--here[this repository only]' '-n[rows]:count' ;;
+        quiet) _values 'quiet mode' on off auto status ;;
+        completion) _values 'shell' bash zsh ;;
+        agents) if (( CURRENT == 3 )); then _values 'agents command' install uninstall status print;
+                else _arguments '--global' '--project' '--target[agents]:agents' '--yes' '--dry-run' '--force' '--no-permissions'; fi ;;
+        config) if (( CURRENT == 3 )); then _values 'config command' list get set unset edit path;
+                elif (( CURRENT == 4 )); then _values 'setting' ${(f)"$(buildlock config list --tsv 2>/dev/null | cut -f1)"}; fi ;;
+        setup|doctor|update|uninstall|help|version) ;;
+        run|explain) shift 2 words; (( CURRENT -= 2 )); _normal ;;
+        *) shift words; (( CURRENT-- )); _normal ;;
+    esac
+}
+compdef _buildlock buildlock
+EOF
+            ;;
+        -h|--help) cmd_help completion ;;
+        *) die_usage "completion: expected bash or zsh" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# help
+
+help_main() {
+    cat <<EOF
+${c_bold}buildlock${c_reset} $bl_version · queue heavy commands so many terminals and coding agents can share one machine
+
+${c_bold}Usage${c_reset}
+  buildlock <command> [args...]        Run a command once the machine has room for it
+  buildlock run [options] [--] <cmd>   The same, with options:
+      --light              a small, quick job: it gets its own lane
+      --heavy              always use the heavy lane
+      --memory MB          memory this job needs (otherwise learned or assumed)
+      --timeout SECONDS    give up after waiting this long (exit code 73)
+
+${c_bold}See what is happening${c_reset}
+  status [--watch] [--json]            Running and queued jobs, and what the next one waits for
+  explain <cmd...>                     How a command would be scheduled, without running it
+  history [-n N] [--here] [--failed]   Recent jobs
+  stats [--days N] [--here]            Run time, memory and waiting per command
+
+${c_bold}Set up${c_reset}
+  setup                                Guided setup
+  config [list|get|set|unset|edit]     Settings (interactive without arguments)
+  quiet [on|off|auto]                  Fewer jobs at once, e.g. at night
+  agents [install|uninstall|status]    Teach Claude Code, Codex, Gemini, Cursor and others to use buildlock
+  doctor                               Check this machine's requirements
+  completion bash|zsh                  Shell completion
+  update [--check]                     Install the latest release
+  uninstall [--purge]                  Remove buildlock
+
+The command's output and exit code pass through unchanged. buildlock's own messages go to stderr.
+Run "buildlock <command> --help" for details · $bl_home
+EOF
+}
+
+help_run() {
+    cat <<EOF
+Usage: buildlock [run] [options] [--] <command> [args...]
+
+Queues the command machine-wide and runs it once there is room: a free slot, load and
+pressure under their limits and enough memory for it. Output and exit code pass through.
+
+Options:
+  --light             a small, quick job (its own lane, smaller memory budget)
+  --heavy             always the heavy lane, even when history says it is small
+  --memory MB         the memory this job needs, until buildlock has learned it
+  --timeout SECONDS   stop waiting after this long and exit with 73
+
+Exit codes: the command's own; 73 timed out waiting; 127 command not found;
+129/130/143 cancelled by HUP/INT/TERM while queued or running.
+Environment: BUILDLOCK_CLASS, BUILDLOCK_JOB_MEMORY_MB, BUILDLOCK_TIMEOUT do the same as the options.
+EOF
+}
+
+help_status() {
+    cat <<'EOF'
+Usage: buildlock status [--watch] [--interval SECONDS] [--json]
+
+Running jobs (slot, age, memory budget, directory, command), queued jobs in the order
+they will start, the machine's load, memory and pressure, and what the next heavy and
+light job wait for.
+
+  -w, --watch       redraw every 2 seconds until Ctrl-C
+  -i, --interval N  seconds between redraws
+  --json            one JSON object, for scripts
+
+"buildlock --status" prints the older one-line-per-job format, which stays stable for scripts.
+EOF
+}
+
+help_history() {
+    cat <<'EOF'
+Usage: buildlock history [-n N] [--here] [--failed] [--all] [--json]
+
+The most recent finished jobs from the job log: when they started, how long they waited
+and ran, their peak memory, exit code, lane, directory and command.
+
+  -n N        how many (default 20)
+  --here      only jobs from the current repository
+  --failed    only jobs that exited non-zero
+  --all       read every month of the log, not just this and last month
+  --json      the raw job-log lines (JSON Lines)
+EOF
+}
+
+help_stats() {
+    cat <<'EOF'
+Usage: buildlock stats [--days N] [--here] [-n N]
+
+Per command: runs, failures, total and typical run time, the memory budget buildlock
+learned for it, its lane and the average wait, sorted by total run time.
+
+  --days N    window to summarize (default 30)
+  --here      only the current repository
+  -n N        rows to show (default 15)
+EOF
+}
+
+help_config() {
+    cat <<'EOF'
+Usage: buildlock config                     interactive menu
+       buildlock config list [--tsv]        every setting, its value and where it comes from
+       buildlock config get KEY
+       buildlock config set KEY VALUE       e.g. buildlock config set SLOTS 2
+       buildlock config unset KEY           back to the default
+       buildlock config edit                open the file in $EDITOR
+       buildlock config path
+
+The config file (~/.config/buildlock/config, or $BUILDLOCK_CONFIG) is bash, sourced on
+every call. Environment variables BUILDLOCK_<KEY> win over it. During quiet hours each
+QUIET_<KEY> replaces <KEY>.
+EOF
+}
+
+help_quiet() {
+    cat <<'EOF'
+Usage: buildlock quiet [status|on|off|auto]
+
+Quiet mode runs fewer jobs at once (QUIET_SLOTS, QUIET_WORKERS, QUIET_LIGHT_SLOTS), so a
+machine stays cooler and quieter, e.g. at night.
+
+  status   whether quiet mode is on now, and the limits in effect
+  on       force it on until "auto" or "off"
+  off      force it off
+  auto     follow QUIET_HOURS again (buildlock config set QUIET_HOURS 00:00-08:00)
+EOF
+}
+
+help_agents() {
+    cat <<'EOF'
+Usage: buildlock agents [install] [--global | --project] [--target LIST] [--yes] [--dry-run] [--force] [--no-permissions]
+       buildlock agents uninstall [--global | --project] [--target LIST]
+       buildlock agents status
+       buildlock agents print [--project]
+
+Writes a short, marker-fenced instructions section into each coding agent's
+instructions file, so every session (and subagent) learns to wrap heavy commands
+in buildlock:
+
+  --global    the agent's global instructions ("memory"), e.g. ~/.claude/CLAUDE.md,
+              ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (default)
+  --project   this repository's files: AGENTS.md, CLAUDE.md, GEMINI.md,
+              .cursor/rules, .github/copilot-instructions.md, ... with the project's
+              own build and test commands listed
+  --target    auto (detected agents, default), all, none, or a list such as claude,codex
+  --force     also add the section to files that already mention buildlock
+  --no-permissions   don't let Claude Code run buildlock status/explain/history/stats without asking
+
+Agents: claude, codex, gemini, opencode, qwen, cursor, windsurf, copilot, kiro, droid,
+pi, kimi, grok. Wrapped commands themselves always keep the agent's normal permission
+prompt. "uninstall" removes exactly what "install" wrote.
+EOF
+}
+
+help_doctor() { printf 'Usage: buildlock doctor\n\nChecks the requirements (Linux, bash 5, flock, setsid, ps, /proc), this installation,\nthe config file and which coding agents know about buildlock. Exits 1 on a problem.\n'; }
+help_update() { printf 'Usage: buildlock update [--check] [--version vX.Y.Z] [--force]\n\nDownloads the latest release (or the given one), verifies its checksum and replaces this\nfile by rename, so running jobs are not disturbed.\n'; }
+help_uninstall() { printf 'Usage: buildlock uninstall [--yes] [--purge] [--keep-agents]\n\nRemoves buildlock and the instructions it added to coding agents. --purge also removes\nthe config, the job log and the lock files.\n'; }
+
+cmd_help() {
+    case "${1:-}" in
+        ''|help) help_main ;;
+        run) help_run ;;
+        status) help_status ;;
+        history|log) help_history ;;
+        stats) help_stats ;;
+        config) help_config ;;
+        quiet) help_quiet ;;
+        agents|ai) help_agents ;;
+        doctor) help_doctor ;;
+        update|upgrade) help_update ;;
+        uninstall) help_uninstall ;;
+        explain) printf 'Usage: buildlock explain <command> [args...]\n\nPrints the job key, learned profile, lane, memory budget and whether it would start now.\n' ;;
+        setup|init) printf 'Usage: buildlock setup\n\nGuided setup: concurrency, memory, quiet hours and coding agents.\n' ;;
+        completion) printf 'Usage: buildlock completion bash|zsh\n\n  bash: eval "$(buildlock completion bash)"     in ~/.bashrc\n  zsh:  source <(buildlock completion zsh)      in ~/.zshrc, after compinit\n' ;;
+        *) die_usage "no help for '$1'" ;;
+    esac
+}
+
+# A close subcommand name for a typo, or nothing.
+suggest_command() {
+    local word="$1" cmd
+    for cmd in run status explain history stats config quiet agents setup doctor update uninstall completion help version; do
+        if [[ "$cmd" == "$word"* || "$word" == "$cmd"* ]] || (( $(edit_distance "$word" "$cmd") <= 2 )); then printf '%s' "$cmd"; return 0; fi
+    done
+    return 0
+}
+
+edit_distance() {
+    local a="$1" b="$2" i j cost prev=() cur=()
+    for (( j = 0; j <= ${#b}; j++ )); do prev[j]=$j; done
+    for (( i = 1; i <= ${#a}; i++ )); do
+        cur=("$i")
+        for (( j = 1; j <= ${#b}; j++ )); do
+            cost=1
+            [[ "${a:i-1:1}" != "${b:j-1:1}" ]] || cost=0
+            cur[j]=$(( prev[j] + 1 ))
+            (( cur[j - 1] + 1 >= cur[j] )) || cur[j]=$(( cur[j - 1] + 1 ))
+            (( prev[j - 1] + cost >= cur[j] )) || cur[j]=$(( prev[j - 1] + cost ))
+        done
+        prev=("${cur[@]}")
+    done
+    printf '%s' "${prev[${#b}]}"
+}
+
+# Run options (after `run`, directly after `buildlock`, or after `explain`):
+# exported as the environment variables they stand for; the command that
+# follows is left in run_args.
+parse_run_options() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --light) export BUILDLOCK_CLASS=light ;;
+            --heavy) export BUILDLOCK_CLASS=heavy ;;
+            --memory) need_value "$@"; [[ "$2" =~ ^[1-9][0-9]*$ ]] || die_usage "--memory needs megabytes"; export BUILDLOCK_JOB_MEMORY_MB="$2"; shift ;;
+            --memory=*) [[ "${1#*=}" =~ ^[1-9][0-9]*$ ]] || die_usage "--memory needs megabytes"; export BUILDLOCK_JOB_MEMORY_MB="${1#*=}" ;;
+            --timeout) need_value "$@"; export BUILDLOCK_TIMEOUT="$2"; shift ;;
+            --timeout=*) export BUILDLOCK_TIMEOUT="${1#*=}" ;;
+            --) shift; break ;;
+            -*) die_usage "unknown option '$1'" ;;
+            *) break ;;
+        esac
+        shift
+    done
+    run_args=("$@")
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch. Everything but running a command exits here.
+
+setup_ui
+case "${1:-}" in
+    '') help_main; exit 0 ;;
+    -h|--help|help) shift; cmd_help "$@"; exit 0 ;;
+    -V|--version|version) printf 'buildlock %s\n' "$bl_version"; exit 0 ;;
+    --status) resolve_job; status; exit 0 ;;
+    --explain|explain)
+        shift
+        parse_run_options "$@"
+        set -- "${run_args[@]}"
+        if [[ $# -eq 0 ]]; then printf 'usage: buildlock --explain command args...\n' >&2; exit 2; fi
+        resolve_job "$@"
+        cmd_explain
+        exit 0
+        ;;
+    status) shift; resolve_job; cmd_status "$@"; exit 0 ;;
+    history|log) shift; cmd_history "$@"; exit 0 ;;
+    stats) shift; cmd_stats "$@"; exit 0 ;;
+    config) shift; cmd_config "$@"; exit 0 ;;
+    quiet) shift; cmd_quiet "$@"; exit 0 ;;
+    agents|ai) shift; cmd_agents "$@"; exit 0 ;;
+    setup|init) shift; cmd_setup "$@"; exit 0 ;;
+    doctor) shift; resolve_job; cmd_doctor "$@"; exit $? ;;
+    update|upgrade) shift; cmd_update "$@"; exit 0 ;;
+    uninstall) shift; cmd_uninstall "$@"; exit 0 ;;
+    completion) shift; cmd_completion "$@"; exit 0 ;;
+    run) shift; [[ "${1:-}" != -h && "${1:-}" != --help ]] || { help_run; exit 0; } ;;
+esac
+
+
+parse_run_options "$@"
+set -- "${run_args[@]}"
+if [[ "$#" -eq 0 ]]; then
+    printf 'usage: buildlock [--status | --explain command args... | command args...]\n' >&2
+    exit 2
+fi
+
+# Fail fast instead of queueing a command that cannot start (setsid needs an
+# executable: shell functions and aliases of the caller don't exist here).
+if [[ "$1" == */* ]]; then
+    [[ -x "$1" && ! -d "$1" ]] || { printf 'buildlock: %s: not an executable file\n' "$1" >&2; exit 127; }
+elif ! type -P -- "$1" > /dev/null; then
+    hint="$(suggest_command "$1")"
+    printf 'buildlock: command not found: %s%s\n' "$1" "${hint:+ (did you mean \"buildlock $hint\"?)}" >&2
+    exit 127
+fi
+
+if (( bypass == 1 )); then
+    exec "$@"
+fi
+
+resolve_job "$@"
+mkdir -p "$(dirname "$lock_path")" "$queue_dir"
+
+# A copied environment variable is insufficient: the recorded holder must be
+# alive and in this process's ancestry for this exact lock path. A light call
+# nested in any holder passes through as before; a heavy call nested inside a
+# light holder must queue as heavy instead, so heavy work never runs on a
+# light slot.
+if [[ "${BUILDLOCK_HELD:-}" =~ ^[0-9]+$ ]] && is_ancestor "$BUILDLOCK_HELD"; then
+    held_class="$(holder_class_for_pid "$BUILDLOCK_HELD" || true)"
+    if [[ -n "$held_class" ]] && { [[ "$job_class" == light ]] || [[ "$held_class" == heavy ]]; }; then
+        exec "$@"
+    fi
+fi
+
+timeout_us=''
+if [[ -n "${BUILDLOCK_TIMEOUT:-}" ]]; then
+    if [[ ! "$BUILDLOCK_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        printf 'buildlock: BUILDLOCK_TIMEOUT must be nonnegative seconds\n' >&2
+        exit 2
+    fi
+    timeout_us="$(awk -v t="$BUILDLOCK_TIMEOUT" 'BEGIN { printf "%d", t * 1000000 }')"
+fi
+
+queued_at="$EPOCHSECONDS"
+queued_us="${EPOCHREALTIME/[.,]/}"
+queue_file="$queue_dir/$self_pid"
+queue_temp="$queue_dir/.$self_pid.tmp"
+
+slot_fd=''
+my_slot=''
+my_class=''
+job_started=''
+command_result=''
+cancel_signal=''
+cancel_status=0
+command_pid=''
+command_pgid=''
+command_stdin_fd=''
+admission_mode=free
+sampler_pid=''
+peak_file=''
+peak_mb=0
+last_wait_reason=''
+announced=0
+
+# Background peak-RSS sampler for this job's process tree (tree_rss_kb on
+# $self_pid), first sampling one interval in, so short jobs pay nothing. It
+# pauses with `read -t` instead of an external sleep and has no stdio, so
+# nothing it starts can outlive it holding the job's output pipes open.
+start_sampler() {
+    peak_file="${TMPDIR:-/tmp}/buildlock-peak.$self_pid"
+    printf '0\n' 2>/dev/null > "$peak_file" || { peak_file=''; return 0; }
+    (
+        exec {slot_fd}>&- </dev/null >/dev/null 2>&1
+        exec {pause_fd}<> <(:)
+        while :; do
+            read -r -t "$sample_seconds" -u "$pause_fd" _ || true
+            rss="$(tree_rss_kb "$self_pid")"
+            [[ "$rss" =~ ^[0-9]+$ ]] || rss=0
+            peak_kb=0
+            read -r peak_kb < "$peak_file" || true
+            [[ "$peak_kb" =~ ^[0-9]+$ ]] || peak_kb=0
+            (( rss <= peak_kb )) || printf '%s\n' "$rss" > "$peak_file"
+        done
+    ) &
+    sampler_pid=$!
+}
+stop_sampler() {
+    [[ -n "$sampler_pid" ]] || return 0
+    kill "$sampler_pid" 2>/dev/null || true
+    wait "$sampler_pid" 2>/dev/null || true
+    sampler_pid=''
+    if [[ -n "$peak_file" && -r "$peak_file" ]]; then
+        local kb=0
+        read -r kb < "$peak_file" 2>/dev/null || true
+        [[ "$kb" =~ ^[0-9]+$ ]] || kb=0
+        peak_mb=$(( kb / 1024 ))
+    fi
+    [[ -z "$peak_file" ]] || rm -f "$peak_file" 2>/dev/null || true
+    peak_file=''
+}
+
+# Appends one job-log line when this process actually acquired a slot;
+# logging failures are ignored and never change the job's own exit code.
+write_job_log() {
+    [[ -n "$my_slot" && -n "$job_started" ]] || return 0
+    local log_file start_iso end_iso cmd
+    mkdir -p "$job_log_dir" 2>/dev/null || return 0
+    log_file="$job_log_dir/jobs-$(date -u +%Y-%m).jsonl"
+    start_iso="$(date -u -d "@$job_started" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || return 0
+    end_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    cmd="$*"
+    cmd="${cmd:0:200}"
+    (
+        flock -w 2 9 || exit 0
+        printf '{"at":"%s","end":"%s","pid":%s,"cwd":"%s","class":"%s","budgetMb":%s,"waitSeconds":%s,"runSeconds":%s,"exit":%s,"cmd":"%s","key":"%s","peakMb":%s,"budgetSource":"%s","admission":"%s"}\n' \
+            "$start_iso" "$end_iso" "$self_pid" "$(json_escape "$PWD")" "$my_class" "$job_memory_mb" \
+            "$(( job_started - queued_at ))" "$(( EPOCHSECONDS - job_started ))" "${command_result:-0}" "$(json_escape "$cmd")" \
+            "$(json_escape "$job_key")" "${peak_mb:-0}" "$budget_source" "${admission_mode:-free}" >&9
+    ) 9>>"$log_file" 2>/dev/null || true
+}
+cleanup() {
+    local pid=''
+    if [[ -n "$command_pid" ]]; then
+        terminate_command_tree TERM
+        wait "$command_pid" 2>/dev/null || true
+        command_pid=''
+    fi
+    if [[ -n "$command_stdin_fd" ]]; then
+        exec {command_stdin_fd}<&-
+        command_stdin_fd=''
+    fi
+    rm -f "$queue_file" "$queue_temp"
+    stop_sampler || true
+    if [[ -n "$my_slot" ]]; then
+        IFS=$'\t' read -r pid _ 2>/dev/null < "$(slot_holder "$my_slot" "$my_class")" || true
+        [[ "$pid" != "$self_pid" ]] || rm -f "$(slot_holder "$my_slot" "$my_class")"
+    fi
+    [[ -z "$slot_fd" ]] || flock -u "$slot_fd" || true
+    write_job_log "$@" || true
+}
+trap 'cleanup "$@"' EXIT
+
+signal_job() {
+    local signal="$1"
+    if [[ -z "$cancel_signal" ]]; then
+        cancel_signal="$signal"
+        case "$signal" in
+            HUP) cancel_status=129 ;;
+            INT) cancel_status=130 ;;
+            TERM) cancel_status=143 ;;
+        esac
+        command_result="$cancel_status"
+        if [[ -n "$command_pgid" ]]; then
+            kill -s "$signal" -- "-$command_pgid" 2>/dev/null || true
+        fi
+    else
+        if [[ -n "$command_pgid" ]]; then
+            kill -KILL -- "-$command_pgid" 2>/dev/null || true
+        fi
+    fi
+}
+trap 'signal_job HUP' HUP
+trap 'signal_job INT' INT
+trap 'signal_job TERM' TERM
+
+printf '%s\t%s\t%s\tscheduled\t%s\t%s\n' "$self_pid" "$queued_at" "$PWD" "$queued_us" "$job_class" > "$queue_temp"
+mv -f "$queue_temp" "$queue_file"
+my_queue_key="$queued_us"
+
+command_group_alive() {
+    [[ -n "$command_pgid" ]] || return 1
+    local stat rest state pgrp
+    for stat in /proc/[0-9]*/stat; do
+        [[ -r "$stat" ]] || continue
+        IFS= read -r rest < "$stat" || continue
+        rest="${rest##*) }"
+        read -r state _ pgrp _ <<< "$rest"
+        [[ "$pgrp" == "$command_pgid" && "$state" != Z && "$state" != X ]] && return 0
+    done
+    return 1
+}
+
+terminate_command_tree() {
+    local signal="${1:-TERM}" elapsed=0
+    [[ -n "$command_pgid" ]] || return 0
+    kill -s "$signal" -- "-$command_pgid" 2>/dev/null || true
+    while command_group_alive && (( elapsed < 10 )); do
+        read -r -t 0.1 -u "$tick_fd" _ || true
+        elapsed=$(( elapsed + 1 ))
+    done
+    if command_group_alive; then
+        kill -KILL -- "-$command_pgid" 2>/dev/null || true
+        elapsed=0
+        while command_group_alive && (( elapsed < 20 )); do
+            read -r -t 0.1 -u "$tick_fd" _ || true
+            elapsed=$(( elapsed + 1 ))
+        done
+    fi
+}
+
+exec {sched_fd}>> "$sched_path"
+# `read -t` on a pipe we also hold open for writing sleeps without forking.
+exec {tick_fd}<> <(:)
+
+# Succeeds when an idle admission went past what a busy machine allows: the
+# lane's normal slot count ($1 running of $2), or, unless $3 skips it, the
+# start gap. Only the logged `admission` field depends on it.
+needs_idle_path() {
+    local last=0
+    (( $1 < $2 )) || return 0
+    (( $3 == 0 )) || return 1
+    read -r last 2>/dev/null < "$started_file" || true
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( EPOCHSECONDS - last < start_gap ))
+}
+
+# Holding the scheduler mutex: start in a free slot if wait_reason allows. A
+# lane's slot scan reaches its hard cap only while idle; otherwise it stops at
+# the lane's normal slot count. The refusal reason is kept in last_wait_reason
+# for the one-time "waiting" notice.
+try_start() {
+    local summary heavy_count light_count jobs reason slot first_slot=0 fd scan_limit
+    summary="$(running_summary)"
+    read -r heavy_count light_count jobs <<< "$summary"
+    # The idle probe costs processes, so it runs only when it could change the
+    # verdict: the normal limits block this job and the lane's cap is higher
+    # (or, for heavy, the start gap is what blocks).
+    idle=0
+    if [[ "$job_class" == light ]]; then
+        if (( light_max_jobs > light_slots )) && needs_idle_path "$light_count" "$light_slots" 1; then
+            idle_check "$(live_holders)"
+        fi
+    elif needs_idle_path "$heavy_count" "$slots" 0 && (( max_jobs > slots || heavy_count < slots )); then
+        idle_check "$(live_holders)"
+    fi
+    if [[ "$job_class" == light ]]; then
+        scan_limit="$light_slots"
+        (( idle == 0 )) || scan_limit="$light_max_jobs"
+        reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+        if [[ -n "$reason" ]]; then last_wait_reason="$reason"; return 1; fi
+        admission_mode=free
+        (( idle == 0 )) || ! needs_idle_path "$light_count" "$light_slots" 1 || admission_mode=idle
+        for (( slot = 0; slot < scan_limit; slot++ )); do
+            exec {fd}>> "$(slot_lock "$slot" light)"
+            if flock -n "$fd"; then
+                slot_fd="$fd"
+                my_slot="$slot"
+                my_class=light
+                printf '%s\t%s\t%s\t%s\t%s\n' "$self_pid" "$EPOCHSECONDS" "$PWD" "$job_memory_mb" light > "$(slot_holder "$slot" light).$self_pid.tmp"
+                mv -f "$(slot_holder "$slot" light).$self_pid.tmp" "$(slot_holder "$slot" light)"
+                rm -f "$queue_file"
+                return 0
+            fi
+            exec {fd}>&-
+        done
+        last_wait_reason="all $scan_limit light slots busy"
+        return 1
+    fi
+    scan_limit="$slots"
+    (( idle == 0 )) || scan_limit="$max_jobs"
+    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    if [[ -n "$reason" ]]; then last_wait_reason="$reason"; return 1; fi
+    admission_mode=free
+    (( idle == 0 )) || ! needs_idle_path "$heavy_count" "$slots" 0 || admission_mode=idle
+    # Let waiters of the previous script drain through slot 0.
+    (( legacy_waiting == 0 )) || first_slot=1
+    for (( slot = first_slot; slot < scan_limit; slot++ )); do
+        exec {fd}>> "$(slot_lock "$slot")"
+        if flock -n "$fd"; then
+            slot_fd="$fd"
+            my_slot="$slot"
+            my_class=heavy
+            printf '%s\t%s\t%s\t%s\n' "$self_pid" "$EPOCHSECONDS" "$PWD" "$job_memory_mb" > "$(slot_holder "$slot").$self_pid.tmp"
+            mv -f "$(slot_holder "$slot").$self_pid.tmp" "$(slot_holder "$slot")"
+            printf '%s\n' "$EPOCHSECONDS" > "$started_file.$self_pid.tmp"
+            mv -f "$started_file.$self_pid.tmp" "$started_file"
+            rm -f "$queue_file"
+            return 0
+        fi
+        exec {fd}>&-
+    done
+    last_wait_reason="all $scan_limit slots busy"
+    return 1
+}
+
+while true; do
+    if [[ -n "$cancel_signal" ]]; then
+        command_result="$cancel_status"
+        exit "$command_result"
+    fi
+    scan_queue
+    if { { [[ "$job_class" == light ]] && [[ "$light_head_pid" == "$self_pid" ]]; } \
+        || { [[ "$job_class" != light ]] && [[ "$head_pid" == "$self_pid" ]]; }; } && flock -w 30 "$sched_fd"; then
+        # Re-check under the mutex; only this lane's head ever takes a slot.
+        scan_queue
+        started=1
+        if [[ "$job_class" == light ]]; then
+            [[ "$light_head_pid" == "$self_pid" ]] && try_start || started=0
+        else
+            [[ "$head_pid" == "$self_pid" ]] && try_start || started=0
+        fi
+        flock -u "$sched_fd"
+        if [[ -n "$cancel_signal" ]]; then
+            command_result="$cancel_status"
+            exit "$command_result"
+        fi
+        (( started == 0 )) || break
+    fi
+    # One notice once a job has waited 2 seconds, so a person or an agent
+    # reading the output knows it is queued, not hung.
+    if (( announced == 0 && ${EPOCHREALTIME/[.,]/} - queued_us >= 2000000 )); then
+        announced=1
+        if (( queue_ahead > 0 )); then
+            printf 'buildlock: queued behind %s job(s); starts on its own (buildlock status shows why)\n' "$queue_ahead" >&2
+        else
+            printf 'buildlock: waiting (%s); starts on its own\n' "${last_wait_reason:-machine busy}" >&2
+        fi
+    fi
+    if [[ -n "$timeout_us" ]] && (( ${EPOCHREALTIME/[.,]/} - queued_us >= timeout_us )); then
+        printf 'buildlock: timed out after %ss; ' "$BUILDLOCK_TIMEOUT" >&2
+        status >&2
+        exit 73
+    fi
+    # Sleep one tick, but never past the caller's timeout.
+    tick_us=$(( 500000 + RANDOM % 5 * 100000 ))
+    if [[ -n "$timeout_us" ]]; then
+        remaining_us=$(( timeout_us - (${EPOCHREALTIME/[.,]/} - queued_us) ))
+        (( remaining_us >= tick_us )) || tick_us=$(( remaining_us > 10000 ? remaining_us : 10000 ))
+    fi
+    printf -v tick '%d.%06d' $(( tick_us / 1000000 )) $(( tick_us % 1000000 ))
+    read -r -t "$tick" -u "$tick_fd" _ || true
+done
+exec {sched_fd}>&-
+
+export BUILDLOCK_HELD="$self_pid"
+job_started="$EPOCHSECONDS"
+idle_suffix=''
+[[ "$admission_mode" != idle ]] || idle_suffix=' idle'
+if [[ "$my_class" == light ]]; then
+    printf 'buildlock: waited %ss (light slot %s of %s)%s\n' "$(( job_started - queued_at ))" "$my_slot" "$light_slots" "$idle_suffix" >&2
+else
+    printf 'buildlock: waited %ss (slot %s of %s)%s\n' "$(( job_started - queued_at ))" "$my_slot" "$slots" "$idle_suffix" >&2
+fi
+
+# The class and budget describe this job only: a command inside it that starts
+# its own buildlock (a test fixture, a task-lock child) chooses its own.
+unset BUILDLOCK_CLASS BUILDLOCK_JOB_MEMORY_MB
+set +e
+start_sampler
+if [[ -n "$cancel_signal" ]]; then
+    command_result="$cancel_status"
+else
+    if [[ -e "/proc/$self_pid/fd/0" ]]; then
+        exec {command_stdin_fd}<&0
+    else
+        exec {command_stdin_fd}</dev/null
+    fi
+    setsid --wait -- "$@" <&"$command_stdin_fd" {command_stdin_fd}>&- {slot_fd}>&- {tick_fd}>&- &
+    command_pid=$!
+    command_pgid="$command_pid"
+    exec {command_stdin_fd}<&-
+    command_stdin_fd=''
+    if [[ -n "$cancel_signal" ]]; then
+        kill -s "$cancel_signal" -- "-$command_pgid" 2>/dev/null || true
+    fi
+    wait "$command_pid"
+    command_result=$?
+    if command_group_alive; then
+        terminate_command_tree TERM
+    fi
+    # A trapped signal may interrupt the first wait before the direct child
+    # exits. Reap it after its process group has stopped.
+    wait "$command_pid" 2>/dev/null || true
+    command_pid=''
+    command_pgid=''
+    if [[ -n "$cancel_signal" ]]; then
+        command_result="$cancel_status"
+    fi
+fi
+stop_sampler
+set -e
+exit "$command_result"
