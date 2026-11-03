@@ -5,31 +5,71 @@ on:
         tags: ['v*']
 
 permissions:
-    contents: write
+    contents: read
 
 jobs:
-    release:
+    check:
+        name: Check
         runs-on: ubuntu-latest
         steps:
-            -   uses: actions/checkout@v4
-            -   uses: oven-sh/setup-bun@v2
-            -   name: Tag matches the script's version
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+            -   uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+                with:
+                    bun-version: 1.4.4
+            -   uses: ./.github/actions/shellcheck
+            -   name: The tag matches the script's version and the changelog
                 run: |
                     version="$(sed -n 's/^bl_version=//p' bin/buildlock)"
-                    test "v$version" = "$GITHUB_REF_NAME" || { echo "bin/buildlock says $version, tag is $GITHUB_REF_NAME"; exit 1; }
-            -   run: shellcheck bin/buildlock install.sh
+                    test "v$version" = "$GITHUB_REF_NAME" || { echo "bin/buildlock says $version, the tag is $GITHUB_REF_NAME"; exit 1; }
+                    grep -qx "## $version" CHANGELOG.md || { echo "CHANGELOG.md has no '## $version' heading"; exit 1; }
+            -   run: shellcheck bin/buildlock install.sh scripts/release.sh
             -   run: bun test
+
+    publish:
+        name: Publish
+        needs: check
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            id-token: write
+            attestations: write
+        steps:
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
             -   name: Assets
                 run: |
                     mkdir dist
                     cp bin/buildlock install.sh dist/
                     (cd dist && sha256sum buildlock > buildlock.sha256 && sha256sum install.sh > install.sh.sha256)
+            -   uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+                with:
+                    subject-path: 'dist/buildlock, dist/install.sh'
             -   name: Release notes from CHANGELOG.md
                 run: |
                     version="${GITHUB_REF_NAME#v}"
                     awk -v v="## $version" '$0 == v { on = 1; next } /^## / && on { exit } on' CHANGELOG.md > notes.md
-                    test -s notes.md || echo "buildlock $version" > notes.md
+                    test -s notes.md || { echo "no notes for $version in CHANGELOG.md"; exit 1; }
             -   name: Publish
                 env:
                     GH_TOKEN: ${{ github.token }}
-                run: gh release create "$GITHUB_REF_NAME" dist/* --title "buildlock ${GITHUB_REF_NAME#v}" --notes-file notes.md
+                run: |
+                    prerelease=()
+                    [[ "$GITHUB_REF_NAME" != *-* ]] || prerelease=(--prerelease)
+                    gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "buildlock ${GITHUB_REF_NAME#v}" --notes-file notes.md "${prerelease[@]}"
+
+    smoke:
+        name: Install the release
+        needs: publish
+        runs-on: ubuntu-latest
+        steps:
+            -   name: The one-line installer, as users run it
+                run: |
+                    set -euo pipefail
+                    sleep 10
+                    curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/install.sh" \
+                        | bash -s -- --version "$GITHUB_REF_NAME" --prefix "$RUNNER_TEMP/bin" --yes
+                    test "$("$RUNNER_TEMP/bin/buildlock" --version)" = "buildlock ${GITHUB_REF_NAME#v}"
+                    test "$("$RUNNER_TEMP/bin/buildlock" bash -c 'echo ok')" = ok

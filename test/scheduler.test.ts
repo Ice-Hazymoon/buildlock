@@ -40,7 +40,8 @@ function fixture(machine: Partial<IMachine> = {}, slots = 1, lightSlots = 1): { 
         root,
         lock: resolve(root, 'buildlock.lock'),
         env: {
-            ...process.env,
+            // The caller's own buildlock settings (a test run inside buildlock) stay out.
+            ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(BUILDLOCK_|VITEST_MAX_|JEST_MAX_)/.test(key))),
             BUILDLOCK_LOCK_PATH: resolve(root, 'buildlock.lock'),
             BUILDLOCK_PROC_ROOT: procRoot,
             // Ignore the machine's ~/.config/buildlock/config so tests see stock defaults.
@@ -89,7 +90,7 @@ async function waitFor(path: string): Promise<void> {
 
 test('nested calls by the live holder finish without taking the lock twice', async () => {
     const { env } = fixture();
-    const result = await finished(start(['bash', '-c', '"$BUILDLOCK_SCRIPT" bash -c "test \"$VITEST_MAX_WORKERS\" = 8"'], { ...env, BUILDLOCK_SCRIPT: script }));
+    const result = await finished(start(['bash', '-c', '"$BUILDLOCK_SCRIPT" true'], { ...env, BUILDLOCK_SCRIPT: script }));
     expect(result.code).toBe(0);
 });
 
@@ -100,7 +101,7 @@ test('an unrelated process cannot use an inherited holder pid to bypass the queu
         await waitFor(`${lock}.holder`);
         const result = await finished(start(['true'], { ...env, BUILDLOCK_HELD: String(holder.pid), BUILDLOCK_TIMEOUT: '0.1' }));
         expect(result.code).toBe(73);
-        expect(result.stderr).toContain('holder');
+        expect(result.stderr).toContain('the command did not run');
     } finally {
         holder.kill('SIGTERM');
         await finished(holder);
@@ -139,11 +140,11 @@ test('a caller-specified timeout exits differently from task-lock busy', async (
     }
 });
 
-test('the existing worker limits remain exported to the command', async () => {
+test('the Vitest worker cap is exported only when asked for', async () => {
     const { env } = fixture();
-    const result = await finished(start(['bash', '-c', 'printf "%s,%s,%s,%s" "$VITEST_MAX_WORKERS" "$VITEST_MAX_FORKS" "$VITEST_MAX_THREADS" "$JEST_MAX_WORKERS"'], env));
-    expect(result.code).toBe(0);
-    expect(result.stdout).toBe('8,8,8,8');
+    const show = ['bash', '-c', 'printf "%s,%s" "$BUILDLOCK_WORKERS" "${VITEST_MAX_WORKERS:-unset}"'];
+    expect((await finished(start(show, env))).stdout).toBe('8,unset');
+    expect((await finished(start(show, { ...env, BUILDLOCK_EXPORT_WORKERS: 'on' }))).stdout).toBe('8,8');
 });
 
 test('a second job starts beside a running one while the machine has room', async () => {
@@ -167,7 +168,7 @@ test('a second job waits while running jobs may still need the memory', async ()
         await waitFor(`${lock}.holder`);
         const result = await finished(start(['true'], { ...env, BUILDLOCK_TIMEOUT: '0.3' }));
         expect(result.code).toBe(73);
-        expect(result.stderr).toContain('next=memory:');
+        expect(result.stderr).toContain('not enough free memory');
     } finally {
         holder.kill('SIGTERM');
         await finished(holder);
@@ -182,7 +183,7 @@ test('a second job waits while the CPU is contended, but a lone job still runs',
         await waitFor(`${lock}.holder`);
         const result = await finished(start(['true'], { ...env, BUILDLOCK_TIMEOUT: '0.3' }));
         expect(result.code).toBe(73);
-        expect(result.stderr).toContain('next=cpu pressure 60% > 25%');
+        expect(result.stderr).toContain('CPU pressure 60%, limit 25%');
     } finally {
         holder.kill('SIGTERM');
         await finished(holder);
@@ -193,7 +194,7 @@ test('critically short memory holds back even a lone job', async () => {
     const { env } = fixture({ availableMb: 1_000 }, 2);
     const result = await finished(start(['true'], { ...env, BUILDLOCK_TIMEOUT: '0.3' }));
     expect(result.code).toBe(73);
-    expect(result.stderr).toContain('next=memory critical');
+    expect(result.stderr).toContain('memory is critically low');
 });
 
 test('waiters start in arrival order', async () => {
@@ -280,7 +281,7 @@ test('a light job waits when memory is critical, just like a heavy one', async (
     const { env } = fixture({ availableMb: 1_000 }, 2, 2);
     const result = await finished(start(['true'], { ...env, BUILDLOCK_CLASS: 'light', BUILDLOCK_TIMEOUT: '0.3' }));
     expect(result.code).toBe(73);
-    expect(result.stderr).toContain('next=memory critical');
+    expect(result.stderr).toContain('memory is critically low');
 });
 
 test('a light job waits once its own slot cap is full, independent of free heavy slots', async () => {

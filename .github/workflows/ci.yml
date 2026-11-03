@@ -10,13 +10,19 @@ permissions:
 
 jobs:
     lint:
-        name: shellcheck
+        name: shellcheck and versions
         runs-on: ubuntu-latest
         steps:
-            -   uses: actions/checkout@v4
-            -   run: shellcheck --version && shellcheck bin/buildlock install.sh
-            -   name: Version is set
-                run: grep -qE '^bl_version=[0-9]+\.[0-9]+\.[0-9]+$' bin/buildlock
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+            -   uses: ./.github/actions/shellcheck
+            -   run: shellcheck --version && shellcheck bin/buildlock install.sh scripts/release.sh
+            -   name: The version has a CHANGELOG section
+                run: |
+                    version="$(sed -n 's/^bl_version=//p' bin/buildlock)"
+                    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "bad bl_version: $version"; exit 1; }
+                    grep -qx "## $version" CHANGELOG.md || { echo "CHANGELOG.md has no '## $version' heading"; exit 1; }
 
     test:
         name: Tests (${{ matrix.os }})
@@ -27,15 +33,21 @@ jobs:
                 # 22.04 ships bash 5.1 and util-linux 2.37; 24.04 bash 5.2 and util-linux 2.39.
                 os: [ubuntu-22.04, ubuntu-24.04]
         steps:
-            -   uses: actions/checkout@v4
-            -   uses: oven-sh/setup-bun@v2
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
+            -   uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+                with:
+                    bun-version: 1.4.4
             -   run: bun test
 
     install:
         name: Installer
         runs-on: ubuntu-latest
         steps:
-            -   uses: actions/checkout@v4
+            -   uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+                with:
+                    persist-credentials: false
             -   name: Install, run, inspect, uninstall
                 run: |
                     set -euo pipefail
@@ -47,7 +59,9 @@ jobs:
                     set +e; buildlock bash -c 'exit 7'; code=$?; set -e
                     test "$code" -eq 7
                     buildlock status --json | python3 -m json.tool > /dev/null
+                    buildlock stats --json | python3 -m json.tool > /dev/null
                     buildlock history --json | python3 -c 'import json, sys; lines = [json.loads(l) for l in sys.stdin]; assert [l["exit"] for l in lines] == [0, 7], lines'
+                    mkdir -p ~/.claude ~/.codex
                     buildlock agents install --target claude,codex --yes
                     grep -q BUILDLOCK_START ~/.claude/CLAUDE.md ~/.codex/AGENTS.md
                     buildlock uninstall --yes --purge

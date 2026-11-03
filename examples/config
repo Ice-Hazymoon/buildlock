@@ -1,7 +1,9 @@
 # Example ~/.config/buildlock/config
 #
-# The file is bash, sourced on every buildlock call. Environment variables set
-# by the caller (BUILDLOCK_SLOTS=1 buildlock ...) win over everything here.
+# The file is bash, run on every buildlock call (apart from buildlock itself:
+# only its BUILDLOCK_* values count, and what it prints goes to stderr).
+# Environment variables set by the caller (BUILDLOCK_SLOTS=1 buildlock ...)
+# win over everything here. Keep it quick.
 # `buildlock config set/unset` only rewrites the lines between the markers.
 
 # >>> buildlock config >>>
@@ -30,9 +32,10 @@ fi
 # CI runners have the machine to themselves: run without queueing.
 [[ -n "${CI:-}" ]] && BUILDLOCK_BYPASS=1
 
-# One project's tool runs many lanes of its own and must not queue; keep its
-# test workers low instead.
+# One project's tool runs many lanes of its own and must not queue; cap its
+# Vitest workers instead (EXPORT_WORKERS exports VITEST_MAX_WORKERS).
 if [[ "$PWD" == "$HOME/projects/big-monorepo"* && "${AI_AGENT:-}" == my-runner* ]]; then
     BUILDLOCK_BYPASS=1
     BUILDLOCK_WORKERS=4
+    BUILDLOCK_EXPORT_WORKERS=on
 fi

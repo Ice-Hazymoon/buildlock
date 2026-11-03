@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -130,9 +130,9 @@ test('quiet hours replace the normal limits while they last', () => {
     run(['config', 'set', 'QUIET_WORKERS', '2'], env);
     run(['config', 'set', 'QUIET_HOURS', '00-24'], env);
     expect(run(['config', 'get', 'SLOTS'], env).stdout).toBe('1\n');
-    expect(run(['bash', '-c', 'printf %s "$VITEST_MAX_WORKERS"'], env).stdout).toBe('2');
+    expect(run(['bash', '-c', 'printf %s "$BUILDLOCK_WORKERS"'], env).stdout).toBe('2');
     expect(run(['--status'], env).stdout).toContain('running=0/1');
-    expect(run(['quiet'], env).stdout).toContain('Quiet mode is on');
+    expect(run(['quiet'], env).stdout).toContain('Quiet mode: on');
     // A range that never matches, a forced off, and an explicit environment value all win.
     run(['config', 'set', 'QUIET_HOURS', '05-05'], env);
     expect(run(['config', 'get', 'SLOTS'], env).stdout).toBe('2\n');
@@ -169,7 +169,8 @@ test('run options set the lane, budget and timeout', () => {
     const ran = run(['run', '--light', '--memory', '512', '--', 'bash', '-c', 'echo ok'], env);
     expect(ran.code).toBe(0);
     expect(ran.stdout).toBe('ok\n');
-    expect(ran.stderr).toMatch(/buildlock: waited \d+s \(light slot 0 of \d+\)/);
+    // A job that starts at once prints nothing of its own.
+    expect(ran.stderr).toBe('');
     expect(run(['--memory', 'lots', 'true'], env).code).toBe(2);
     expect(run(['run'], env).code).toBe(2);
 });
@@ -182,7 +183,7 @@ test('status shows a running job and its command, as text and JSON', async () =>
         const text = run(['status'], env).stdout;
         expect(text).toContain('Running  heavy 1/1');
         expect(text).toContain('sleep 2');
-        expect(text).toContain('heavy: waits · all 1 slots busy');
+        expect(text).toContain('heavy: waits: the one heavy slot is busy');
         const json = JSON.parse(run(['status', '--json'], env).stdout);
         expect(json.running).toHaveLength(1);
         expect(json.running[0].command).toBe('sleep 2');
@@ -202,9 +203,9 @@ test('a job that has to wait says so once, then runs', async () => {
         await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
         const waiter = await finished(spawn(script, ['true'], { env, stdio: ['ignore', 'pipe', 'pipe'] }), 8_000);
         expect(waiter.code).toBe(0);
-        expect(waiter.stderr).toContain('buildlock: waiting (all 1 slots busy); starts on its own');
+        expect(waiter.stderr).toContain('buildlock: waiting (the one heavy slot is busy); starts on its own');
         expect(waiter.stderr.match(/waiting/g)).toHaveLength(1);
-        expect(waiter.stderr).toMatch(/buildlock: waited \d+s/);
+        expect(waiter.stderr).toMatch(/buildlock: waited \d+s \(slot 1 of 1\)/);
     } finally {
         holder.kill('SIGTERM');
         await finished(holder);
@@ -216,7 +217,7 @@ test('BUILDLOCK_BYPASS runs at once, even with every slot busy', async () => {
     const holder = spawn(script, ['sleep', '2'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     try {
         await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
-        const result = run(['bash', '-c', 'printf %s "$VITEST_MAX_WORKERS"'], { ...env, BUILDLOCK_BYPASS: '1', BUILDLOCK_TIMEOUT: '0.2' });
+        const result = run(['bash', '-c', 'printf %s "$BUILDLOCK_WORKERS"'], { ...env, BUILDLOCK_BYPASS: '1', BUILDLOCK_TIMEOUT: '0.2' });
         expect(result.code).toBe(0);
         expect(result.stdout).toBe('8');
     } finally {
@@ -292,28 +293,65 @@ test('agents keep files that already mention buildlock unless forced', () => {
     expect(existsSync(resolve(home, '.claude/settings.json'))).toBe(false);
 });
 
-test('project install lists the project commands and writes shared files once', () => {
+test('project install writes AGENTS.md once, at the repository root, and leaves a symlinked CLAUDE.md alone', () => {
     const { env, root } = sandbox();
     const repo = resolve(root, 'repo');
     mkdirSync(resolve(repo, '.git'), { recursive: true });
-    writeFileSync(resolve(repo, 'package.json'), JSON.stringify({ scripts: { dev: 'vite', test: 'vitest run', typecheck: 'tsc --noEmit', build: 'vite build' } }, null, 2));
+    mkdirSync(resolve(repo, 'packages/web'), { recursive: true });
+    writeFileSync(resolve(repo, 'package.json'), JSON.stringify({ scripts: { dev: 'vite', test: 'vitest run', typecheck: 'tsc --noEmit', build: 'vite build' } }));
     writeFileSync(resolve(repo, 'bun.lock'), '');
     writeFileSync(resolve(repo, 'AGENTS.md'), '# Agents\n');
     symlinkSync('AGENTS.md', resolve(repo, 'CLAUDE.md'));
-    const result = run(['agents', 'install', '--project', '--target', 'claude,codex,opencode,cursor', '--yes', '--no-permissions'], env, repo);
+    // Run from a subdirectory: the files still go to the repository root.
+    const result = run(['agents', 'install', '--project', '--target', 'claude,codex,opencode,cursor', '--yes'], env, resolve(repo, 'packages/web'));
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain('same file as Claude Code');
     const agents = readFileSync(resolve(repo, 'AGENTS.md'), 'utf8');
     expect(agents.match(/BUILDLOCK_START/g)).toHaveLength(1);
     expect(agents).toContain('buildlock bun run test');
     expect(agents).toContain('buildlock bun run typecheck');
     expect(agents).not.toContain('bun run dev');
-    expect(agents).toContain('When `buildlock` is installed');
+    expect(agents).toContain("don't install it");
     expect(lstatSync(resolve(repo, 'CLAUDE.md')).isSymbolicLink()).toBe(true);
-    expect(readFileSync(resolve(repo, '.cursor/rules/buildlock.mdc'), 'utf8')).toContain('alwaysApply: true');
+    expect(existsSync(resolve(repo, 'packages/web/AGENTS.md'))).toBe(false);
+    // Cursor, Copilot and the rest read AGENTS.md: no per-agent copies.
+    expect(existsSync(resolve(repo, '.cursor'))).toBe(false);
+    expect(existsSync(resolve(repo, '.github'))).toBe(false);
+    // No project permissions file (it would be committed by accident).
+    expect(existsSync(resolve(repo, '.claude/settings.local.json'))).toBe(false);
     run(['agents', 'uninstall', '--project'], env, repo);
     expect(readFileSync(resolve(repo, 'AGENTS.md'), 'utf8')).toBe('# Agents\n');
-    expect(existsSync(resolve(repo, '.cursor/rules/buildlock.mdc'))).toBe(false);
+});
+
+test('project install never creates a CLAUDE.md, which would hide AGENTS.md from Claude Code', () => {
+    const { env, root } = sandbox();
+    const repo = resolve(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(resolve(repo, 'AGENTS.md'), '# Rules\nUse pnpm.\n');
+    run(['agents', 'install', '--project', '--yes'], env, repo);
+    expect(existsSync(resolve(repo, 'CLAUDE.md'))).toBe(false);
+    expect(readFileSync(resolve(repo, 'AGENTS.md'), 'utf8')).toContain('Use pnpm.');
+    expect(readFileSync(resolve(repo, 'AGENTS.md'), 'utf8')).toContain('BUILDLOCK_START');
+    // A CLAUDE.md of the project's own gets the section too: Claude reads it instead.
+    writeFileSync(resolve(repo, 'CLAUDE.md'), '# Claude rules\n');
+    run(['agents', 'install', '--project', '--yes'], env, repo);
+    expect(readFileSync(resolve(repo, 'CLAUDE.md'), 'utf8')).toContain('BUILDLOCK_START');
+});
+
+test('project install cleans up what an older version wrote', () => {
+    const { env, root } = sandbox();
+    const repo = resolve(root, 'repo');
+    mkdirSync(resolve(repo, '.cursor/rules'), { recursive: true });
+    mkdirSync(resolve(repo, '.github'), { recursive: true });
+    const block = '<!-- BUILDLOCK_START -->\nold\n<!-- BUILDLOCK_END -->\n';
+    writeFileSync(resolve(repo, 'CLAUDE.md'), block);
+    writeFileSync(resolve(repo, '.cursor/rules/buildlock.mdc'), `---\ndescription: Queue heavy commands (builds, type-checks, test suites) with buildlock\nalwaysApply: true\n---\n\n${block}`);
+    writeFileSync(resolve(repo, '.github/copilot-instructions.md'), `# Copilot\n\n${block}`);
+    const result = run(['agents', 'install', '--project', '--yes'], env, repo);
+    expect(result.code).toBe(0);
+    expect(existsSync(resolve(repo, 'CLAUDE.md'))).toBe(false);
+    expect(existsSync(resolve(repo, '.cursor'))).toBe(false);
+    expect(readFileSync(resolve(repo, '.github/copilot-instructions.md'), 'utf8')).toBe('# Copilot\n');
+    expect(readFileSync(resolve(repo, 'AGENTS.md'), 'utf8')).toContain('BUILDLOCK_START');
 });
 
 test('a project CLAUDE.md that imports AGENTS.md defers to it', () => {
@@ -413,14 +451,29 @@ test('Claude settings keep non-ASCII text, and odd shapes are skipped without fa
 });
 
 test('a settings file that install created goes away on uninstall', () => {
-    const { env, root } = sandbox();
-    const repo = resolve(root, 'repo');
-    mkdirSync(repo, { recursive: true });
-    run(['agents', 'install', '--project', '--target', 'claude', '--yes'], env, repo);
-    expect(existsSync(resolve(repo, '.claude/settings.local.json'))).toBe(true);
-    run(['agents', 'uninstall', '--project'], env, repo);
-    expect(existsSync(resolve(repo, '.claude/settings.local.json'))).toBe(false);
-    expect(existsSync(resolve(repo, 'CLAUDE.md'))).toBe(false);
+    const { env, home } = sandbox();
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    run(['agents', 'install', '--target', 'claude', '--yes'], env);
+    expect(existsSync(resolve(home, '.claude/settings.json'))).toBe(true);
+    run(['agents', 'uninstall', '--global'], env);
+    expect(existsSync(resolve(home, '.claude/settings.json'))).toBe(false);
+    expect(existsSync(resolve(home, '.claude/CLAUDE.md'))).toBe(false);
+});
+
+test('Claude Code rules for wrapped commands are mirrored, never a blanket allow', () => {
+    const { env, home } = sandbox();
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    const settings = { model: 'x', permissions: { allow: ['Bash(npm test:*)', 'Bash(git status)'], deny: ['Bash(git push:*)'] } };
+    writeFileSync(resolve(home, '.claude/settings.json'), JSON.stringify(settings));
+    run(['agents', 'install', '--target', 'claude', '--yes'], env);
+    const perms = JSON.parse(readFileSync(resolve(home, '.claude/settings.json'), 'utf8')).permissions;
+    expect(perms.allow).toContain('Bash(buildlock npm test:*)');
+    expect(perms.allow).toContain('Bash(buildlock status:*)');
+    expect(perms.allow).not.toContain('Bash(buildlock git status)');
+    expect(perms.allow).not.toContain('Bash(buildlock:*)');
+    expect(perms.deny).toContain('Bash(buildlock git push:*)');
+    run(['agents', 'uninstall', '--global'], env);
+    expect(JSON.parse(readFileSync(resolve(home, '.claude/settings.json'), 'utf8'))).toEqual(settings);
 });
 
 test('config refuses to edit a file with a damaged block', () => {
@@ -448,7 +501,7 @@ test('numbers buildlock cannot use fall back to their defaults', () => {
     expect(run(['config', 'set', 'WORKERS', '09'], env).code).toBe(1);
     mkdirSync(resolve(config, '..'), { recursive: true });
     writeFileSync(config, 'BUILDLOCK_WORKERS=abc\nBUILDLOCK_SLOTS=08\n');
-    const result = run(['bash', '-c', 'printf %s "$VITEST_MAX_WORKERS"'], env);
+    const result = run(['bash', '-c', 'printf %s "$BUILDLOCK_WORKERS"'], env);
     expect(result.code).toBe(0);
     expect(result.stdout).toBe('8');
     expect(result.stderr).toContain('ignoring BUILDLOCK_WORKERS');
@@ -540,10 +593,282 @@ test('install.sh reads the installed version instead of running it', () => {
     const prefix = resolve(root, 'bin');
     mkdirSync(prefix, { recursive: true });
     // An old build that would hang if executed.
-    writeFileSync(resolve(prefix, 'buildlock'), '#!/usr/bin/env bash\nsleep 30\n', { mode: 0o755 });
+    writeFileSync(resolve(prefix, 'buildlock'), '#!/usr/bin/env bash\n# buildlock, before versions\nsleep 30\n', { mode: 0o755 });
     const started = Date.now();
     const result = spawnSync('bash', [installer, '--from', script, '--prefix', prefix, '--yes'], { env, encoding: 'utf8', timeout: 15_000 });
     expect(result.status).toBe(0);
     expect(Date.now() - started).toBeLessThan(10_000);
     expect(result.stdout).toContain('updated buildlock unversioned ->');
+});
+
+// Regressions found in the second review (0.2.0).
+
+test('buildlock runs when called through a symlink or under another name', () => {
+    const { env, root } = sandbox();
+    const link = resolve(root, 'bl');
+    symlinkSync(script, link);
+    const result = spawnSync(link, ['bash', '-c', 'echo via-link'], { env, encoding: 'utf8', timeout: 8_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('via-link\n');
+});
+
+test('the config file runs apart: exit, cd and echo in it cannot change the command', () => {
+    const { env, config, home } = sandbox();
+    mkdirSync(resolve(config, '..'), { recursive: true });
+    writeFileSync(config, 'BUILDLOCK_SLOTS=3\necho noise-from-config\ncd /\nIFS=,\nexit 0\nBUILDLOCK_SLOTS=9\n');
+    const result = run(['bash', '-c', 'pwd'], env, home);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe(`${home}\n`);
+    expect(result.stderr).toContain('noise-from-config');
+    expect(run(['config', 'get', 'SLOTS'], env).stdout).toBe('3\n');
+    expect(JSON.parse(run(['status', '--json'], env).stdout).lanes.heavy.slots).toBe(3);
+});
+
+test('an invalid timeout in the config falls back instead of failing every build', () => {
+    const { env, config } = sandbox();
+    mkdirSync(resolve(config, '..'), { recursive: true });
+    writeFileSync(config, 'BUILDLOCK_TIMEOUT=10m\n');
+    const result = run(['bash', '-c', 'echo ran'], env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('ran\n');
+    expect(result.stderr).toContain('ignoring BUILDLOCK_TIMEOUT');
+});
+
+test('a waiter whose queue file was removed puts it back and still runs', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1' });
+    const holder = spawn(script, ['sleep', '1.5'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const waiter = spawn(script, ['true'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        const entry = `${env.BUILDLOCK_LOCK_PATH}.queue/${waiter.pid}`;
+        await waitFor(entry);
+        unlinkSync(entry);
+        expect((await finished(waiter, 10_000)).code).toBe(0);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('a stopped waiter keeps its place without blocking the ones behind it', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1' });
+    const holder = spawn(script, ['sleep', '1'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+    const first = spawn(script, ['true'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.queue/${first.pid}`);
+        first.kill('SIGTSTP');
+        const second = spawn(script, ['true'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        expect((await finished(second, 8_000)).code).toBe(0);
+    } finally {
+        first.kill('SIGCONT');
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+    expect((await finished(first, 8_000)).code).toBe(0);
+}, 20_000);
+
+test('a nested call passes through even when a wrapper dropped BUILDLOCK_HELD', () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1' });
+    const result = run(['bash', '-c', 'env -u BUILDLOCK_HELD "$S" bash -c "echo inner"'], { ...env, S: script, BUILDLOCK_TIMEOUT: '3' });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe('inner\n');
+});
+
+test('a kill -9 of buildlock does not leave its command running outside the queue', async () => {
+    const { env, root } = sandbox({ BUILDLOCK_SAMPLE_SECONDS: '0.5' });
+    const pidFile = resolve(root, 'command.pid');
+    const holder = spawn(script, ['bash', '-c', `echo $$ > ${pidFile}; exec sleep 30`], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    await waitFor(pidFile);
+    await Bun.sleep(100);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    expect(Number.isInteger(pid) && pid > 1).toBe(true);
+    try {
+        holder.kill('SIGKILL');
+        let gone = false;
+        for (let i = 0; i < 80 && !gone; i++) {
+            await Bun.sleep(100);
+            gone = !existsSync(`/proc/${pid}`) || readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]?.startsWith('Z') === true;
+        }
+        expect(gone).toBe(true);
+    } finally {
+        if (Number.isInteger(pid) && pid > 1 && existsSync(`/proc/${pid}`)) {
+            try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+    }
+}, 15_000);
+
+test('a heavy job starved of memory gets its budget kept free by light jobs', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '2', BUILDLOCK_LIGHT_SLOTS: '2', BUILDLOCK_RESERVE_MEMORY_MB: '2048' });
+    const holder = spawn(script, ['sleep', '2'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const light = ['run', '--light', '--timeout', '0.5', 'true'];
+        expect(run(light, env).code).toBe(0);
+        // A heavy head (pid 1 stands in: alive since long before) waiting 2 minutes for 40 GB.
+        const since = Math.floor(Date.now() / 1000) - 120;
+        writeFileSync(`${env.BUILDLOCK_LOCK_PATH}.heavywait`, `1\t${since}\t40000\n`);
+        const starved = run(light, env);
+        expect(starved.code).toBe(73);
+        expect(starved.stderr).toContain('not enough free memory');
+        unlinkSync(`${env.BUILDLOCK_LOCK_PATH}.heavywait`);
+        expect(run(light, env).code).toBe(0);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+});
+
+test('quiet mode without its own limits halves the jobs at once', () => {
+    const { env } = sandbox();
+    const status = run(['--status'], { ...env, BUILDLOCK_QUIET: 'on' }).stdout;
+    expect(status).toContain('running=0/1 ');
+    expect(status).toContain('light=0/2 ');
+    expect(status).toContain('max=1 ');
+    expect(run(['--status'], env).stdout).toContain('running=0/2 ');
+});
+
+test('memory defaults scale down on a small machine', () => {
+    const { env, root } = sandbox();
+    writeFileSync(resolve(root, 'proc/meminfo'), 'MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n');
+    expect(run(['config', 'get', 'CRITICAL_MEMORY_MB'], env).stdout).toBe('819\n');
+    expect(run(['config', 'get', 'RESERVE_MEMORY_MB'], env).stdout).toBe('1024\n');
+    expect(run(['config', 'get', 'DEFAULT_MEMORY_MB'], env).stdout).toBe('2048\n');
+    // 4 GB free is plenty for a lone job here.
+    expect(run(['bash', '-c', 'echo ok'], { ...env, BUILDLOCK_TIMEOUT: '1' }).code).toBe(0);
+});
+
+test('sizes take units, and unknown keys are refused', () => {
+    const { env, config } = sandbox();
+    expect(run(['config', 'set', 'RESERVE_MEMORY_MB', '2G'], env).code).toBe(0);
+    expect(readFileSync(config, 'utf8')).toContain('BUILDLOCK_RESERVE_MEMORY_MB=2048');
+    expect(run(['explain', '--memory', '1.5G', 'true'], env).stdout).toContain('budget=1536MB');
+    expect(run(['config', 'unset', 'NOPE'], env).code).toBe(1);
+    expect(run(['config', 'set', 'BYPASS', 'on'], env).code).toBe(0);
+    expect(run(['config', 'unset', 'BYPASS'], env).code).toBe(0);
+});
+
+test('every subcommand answers --help, and stats has JSON', () => {
+    const { env } = sandbox();
+    for (const sub of ['explain', 'setup', 'status', 'history', 'stats', 'config', 'quiet', 'agents', 'doctor', 'update', 'uninstall', 'completion']) {
+        const result = run([sub, '--help'], env);
+        expect(`${sub}: ${result.code}`).toBe(`${sub}: 0`);
+        expect(result.stdout).toContain('Usage');
+    }
+    run(['bash', '-c', 'exit 0'], env);
+    const stats = JSON.parse(run(['stats', '--json'], env).stdout);
+    expect(stats.jobs).toBe(1);
+    expect(stats.commands[0].runs).toBe(1);
+    expect(run(['history', '--days', '1'], env).stdout).toContain('bash -c exit 0');
+    expect(run(['completion', 'fish'], env).stdout).toContain('complete -c buildlock');
+});
+
+test('bare agents without a terminal only shows the status', () => {
+    const { env, home } = sandbox();
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    const result = run(['agents'], env);
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('buildlock agents');
+    expect(existsSync(resolve(home, '.claude/CLAUDE.md'))).toBe(false);
+});
+
+test('a directory holding only skills/ does not count as an installed agent', () => {
+    const { env, home } = sandbox();
+    mkdirSync(resolve(home, '.qwen/skills/some-skill'), { recursive: true });
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    writeFileSync(resolve(home, '.claude/settings.json'), '{}\n');
+    run(['agents', 'install', '--yes', '--no-permissions'], env);
+    expect(existsSync(resolve(home, '.qwen/QWEN.md'))).toBe(false);
+    expect(readFileSync(resolve(home, '.claude/CLAUDE.md'), 'utf8')).toContain('BUILDLOCK_START');
+    // An explicit target creates the agent's file; uninstall removes it and the directories it made.
+    run(['agents', 'install', '--target', 'kiro', '--yes'], env);
+    expect(existsSync(resolve(home, '.kiro/steering/buildlock.md'))).toBe(true);
+    run(['agents', 'uninstall', '--global'], env);
+    expect(existsSync(resolve(home, '.kiro'))).toBe(false);
+    expect(existsSync(resolve(home, '.qwen/skills/some-skill'))).toBe(true);
+});
+
+test('uninstall cleans global files only, and stops before removing anything it cannot finish', () => {
+    const { env, root, home } = sandbox();
+    const prefix = resolve(root, 'prefix');
+    mkdirSync(prefix, { recursive: true });
+    const copy = resolve(prefix, 'buildlock');
+    copyFileSync(script, copy);
+    chmodSync(copy, 0o755);
+    mkdirSync(resolve(home, '.claude'), { recursive: true });
+    run(['agents', 'install', '--target', 'claude', '--yes', '--no-permissions'], env);
+    const repo = resolve(root, 'repo');
+    mkdirSync(repo, { recursive: true });
+    run(['agents', 'install', '--project', '--yes'], env, repo);
+    chmodSync(prefix, 0o555);
+    try {
+        const refused = spawnSync(copy, ['uninstall', '--yes'], { env, cwd: repo, encoding: 'utf8' });
+        expect(refused.status).toBe(1);
+        expect(refused.stderr).toContain("can't write");
+        expect(readFileSync(resolve(home, '.claude/CLAUDE.md'), 'utf8')).toContain('BUILDLOCK_START');
+    } finally {
+        chmodSync(prefix, 0o755);
+    }
+    expect(spawnSync(copy, ['uninstall', '--yes'], { env, cwd: repo, encoding: 'utf8' }).status).toBe(0);
+    expect(existsSync(copy)).toBe(false);
+    expect(existsSync(resolve(home, '.claude/CLAUDE.md'))).toBe(false);
+    expect(readFileSync(resolve(repo, 'AGENTS.md'), 'utf8')).toContain('BUILDLOCK_START');
+});
+
+test('update explains that main comes from the installer', () => {
+    const { env } = sandbox();
+    const result = run(['update', '--version', 'main'], env);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('install.sh');
+});
+
+test('a full or closed stderr never stops the command', () => {
+    const { env, root } = sandbox();
+    const marker = resolve(root, 'ran');
+    const full = openSync('/dev/full', 'w');
+    try {
+        const result = spawnSync(script, ['bash', '-c', `touch ${marker}`], { env, stdio: ['ignore', 'pipe', full] });
+        expect(result.status).toBe(0);
+    } finally {
+        closeSync(full);
+    }
+    expect(existsSync(marker)).toBe(true);
+});
+
+test('command-not-found errors say what to do', () => {
+    const { env, root } = sandbox();
+    expect(run(['FOO=1', 'node'], env).stderr).toContain('buildlock env FOO=1');
+    expect(run(['make -j8'], env).stderr).toContain('sh -c');
+    const file = resolve(root, 'not-executable.sh');
+    writeFileSync(file, 'echo hi\n');
+    expect(run([file], env).code).toBe(126);
+});
+
+test('install.sh expands ~ in --prefix=, refuses links and foreign files, and explains a root-owned prefix', () => {
+    const { env, root, home } = sandbox();
+    const tilde = spawnSync('bash', [installer, '--from', script, '--prefix=~/tbin', '--yes'], { env, cwd: root, encoding: 'utf8' });
+    expect(tilde.status).toBe(0);
+    expect(existsSync(resolve(home, 'tbin/buildlock'))).toBe(true);
+    expect(existsSync(resolve(root, '~'))).toBe(false);
+    const links = resolve(root, 'links');
+    mkdirSync(links, { recursive: true });
+    symlinkSync(script, resolve(links, 'buildlock'));
+    const link = spawnSync('bash', [installer, '--from', script, '--prefix', links, '--yes'], { env, encoding: 'utf8' });
+    expect(link.status).toBe(1);
+    expect(link.stderr).toContain('symlink');
+    const foreign = resolve(root, 'foreign');
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(resolve(foreign, 'buildlock'), '#!/bin/sh\necho something else\n');
+    expect(spawnSync('bash', [installer, '--from', script, '--prefix', foreign, '--yes'], { env, encoding: 'utf8' }).status).toBe(1);
+    expect(readFileSync(resolve(foreign, 'buildlock'), 'utf8')).toContain('something else');
+    const locked = resolve(root, 'locked');
+    mkdirSync(locked, { recursive: true });
+    chmodSync(locked, 0o555);
+    try {
+        const denied = spawnSync('bash', [installer, '--from', script, '--prefix', resolve(locked, 'bin'), '--yes'], { env, encoding: 'utf8' });
+        expect(denied.status).toBe(1);
+        expect(denied.stderr).toContain('sudo bash');
+    } finally {
+        chmodSync(locked, 0o755);
+    }
 });

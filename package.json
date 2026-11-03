@@ -5,6 +5,6 @@
     "license": "MIT",
     "scripts": {
         "test": "bun test",
-        "lint": "shellcheck bin/buildlock install.sh"
+        "lint": "shellcheck bin/buildlock install.sh scripts/release.sh"
     }
 }
