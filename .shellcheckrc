@@ -2,5 +2,5 @@
 # SC2015  `[[ valid ]] && (( in range )) || die` guards, where die running for either reason is the point.
 # SC2016  awk programs and help text in single quotes.
 # SC2030,SC2031  `$(job_memory_mb=...; wait_reason ...)` scopes an override to one subshell on purpose.
-# SC2329  trap handlers (cleanup, signal_job) are only called through trap.
-disable=SC2015,SC2016,SC2030,SC2031,SC2329
+# SC2317,SC2329  trap handlers (cleanup, signal_job) are only called through trap (the code is SC2317 before shellcheck 0.10).
+disable=SC2015,SC2016,SC2030,SC2031,SC2317,SC2329
