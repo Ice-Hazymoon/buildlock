@@ -141,7 +141,8 @@ test('a caller-specified timeout exits differently from task-lock busy', async (
 });
 
 test('the Vitest worker cap is exported only when asked for', async () => {
-    const { env } = fixture();
+    // WORKERS defaults to min(8, cores): pin the cores so a 4-core CI runner agrees.
+    const env = { ...fixture().env, BUILDLOCK_CORES: '16' };
     const show = ['bash', '-c', 'printf "%s,%s" "$BUILDLOCK_WORKERS" "${VITEST_MAX_WORKERS:-unset}"'];
     expect((await finished(start(show, env))).stdout).toBe('8,unset');
     expect((await finished(start(show, { ...env, BUILDLOCK_EXPORT_WORKERS: 'on' }))).stdout).toBe('8,8');
