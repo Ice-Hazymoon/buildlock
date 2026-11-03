@@ -918,7 +918,7 @@ cmd_explain() {
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$(live_holders)"
     if [[ "$job_class" == light ]]; then
-        verdict="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+        verdict="$(light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
     else
         verdict="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
     fi
@@ -1121,7 +1121,12 @@ human_reason() {
     if [[ "$r" =~ $re ]]; then
         printf 'not enough free memory: %s free, %s for this job' "$(fmt_mb "${BASH_REMATCH[1]}")" "$(fmt_mb "${BASH_REMATCH[3]}")"
         (( BASH_REMATCH[2] == 0 )) || printf ', %s more for jobs still starting' "$(fmt_mb "${BASH_REMATCH[2]}")"
-        printf ' and %s kept in reserve' "$(fmt_mb "${BASH_REMATCH[4]}")"
+        local kept="${BASH_REMATCH[4]}" held=0
+        printf ' and %s kept in reserve' "$(fmt_mb "$kept")"
+        [[ "$lane" != light ]] || held="$(heavy_wait_reserve)"
+        if [[ "$held" =~ ^[0-9]+$ ]] && (( held > 0 && held < kept )); then
+            printf ' (%s of it for a heavy job that has waited longer)' "$(fmt_mb "$held")"
+        fi
         return
     fi
     printf '%s' "$r"
@@ -1139,7 +1144,7 @@ status_human() {
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$holders"
     reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
-    light_reason="$(job_memory_mb="$default_light_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+    light_reason="$(job_memory_mb="$default_light_mb"; light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
     metrics="$(proc_metrics)"
     read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
     ram="$(total_ram_mb)"
@@ -1208,7 +1213,7 @@ status_json() {
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$holders"
     reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
-    light_reason="$(job_memory_mb="$default_light_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+    light_reason="$(job_memory_mb="$default_light_mb"; light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
     metrics="$(proc_metrics)"
     read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
     (( quiet_active == 0 )) || quiet_json=true
@@ -3436,6 +3441,13 @@ heavy_wait_reserve() {
     fi
 }
 
+# wait_reason for the light lane. A heavy head starved of memory for a while
+# gets its budget kept free too, counted in the reserve.
+light_wait_reason() {
+    local reserve_memory_mb=$(( reserve_memory_mb + $(heavy_wait_reserve) ))
+    wait_reason "$@"
+}
+
 main() {
     setup_ui
     case "${1:-}" in
@@ -3575,7 +3587,7 @@ main() {
     # shellcheck disable=SC2034 # read by the TSTP trap
     in_sched=0
     pending_stop=0
-    trap 'if (( in_sched == 1 )); then pending_stop=1; else kill -STOP "$self_pid"; fi' TSTP
+    trap 'if (( in_sched == 1 )); then pending_stop=1; else stop_waiter; fi' TSTP
 
     if ! write_queue_file; then
         printf 'buildlock: cannot write the queue in %s; running the command without queueing\n' "$(dirname "$lock_path")" >&2 || true
@@ -3725,6 +3737,14 @@ main() {
     stop_sampler
     set -e
     finish "$command_result"
+}
+
+# Stops this waiter (Ctrl-Z) until SIGCONT. Then a line on the tick pipe ends
+# the `read -t` the stop interrupted: bash 5.1 resumes it without its timeout,
+# and the waiter would sleep for good.
+stop_waiter() {
+    kill -STOP "$self_pid"
+    [[ -z "${tick_fd:-}" ]] || { printf '\n' >&"$tick_fd"; } 2>/dev/null || true
 }
 
 # Writes this waiter's queue file and holds a lock on it while it waits, which
@@ -3960,8 +3980,7 @@ try_start() {
     if [[ "$job_class" == light ]]; then
         scan_limit="$light_slots"
         (( idle == 0 )) || scan_limit="$light_max_jobs"
-        # A heavy head starved of memory for a while gets its budget kept free too.
-        reason="$(job_memory_mb=$(( job_memory_mb + $(heavy_wait_reserve) )); wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+        reason="$(light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
         if [[ -n "$reason" ]]; then last_wait_reason="$reason"; return 1; fi
         admission_mode=free
         (( idle == 0 )) || ! needs_idle_path "$light_count" "$light_slots" 1 || admission_mode=idle

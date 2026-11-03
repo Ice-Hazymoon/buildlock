@@ -713,6 +713,9 @@ test('a heavy job starved of memory gets its budget kept free by light jobs', as
         const starved = run(light, env);
         expect(starved.code).toBe(73);
         expect(starved.stderr).toContain('not enough free memory');
+        expect(starved.stderr).toContain('for a heavy job that has waited longer');
+        // status agrees with what a light job meets.
+        expect(run(['status'], env).stdout).toMatch(/light: waits: not enough free memory/);
         unlinkSync(`${env.BUILDLOCK_LOCK_PATH}.heavywait`);
         expect(run(light, env).code).toBe(0);
     } finally {
