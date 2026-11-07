@@ -341,3 +341,61 @@ test('a finished job appends a valid job-log line with its exit code', async () 
     expect(entry.budgetMb).toBe(2048);
     expect(entry.cmd).toContain('exit 7');
 });
+
+function jobLog(env: NodeJS.ProcessEnv): Array<Record<string, unknown>> {
+    const logDir = env.BUILDLOCK_JOB_LOG_DIR as string;
+    return readdirSync(logDir).filter((name) => name.endsWith('.jsonl'))
+        .flatMap((name) => readFileSync(resolve(logDir, name), 'utf8').trim().split('\n'))
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+test('a job held back by memory, then admitted, logs the seconds under waitReasons.memory', async () => {
+    // 3500 MB free is above the critical floor but below job (2048) + reserve (2048) once a job runs.
+    const { root, lock, env } = fixture({ availableMb: 3_500 }, 2, 1);
+    const holder = start(['sleep', '30'], env);
+    try {
+        await waitFor(`${lock}.holder`);
+        const waiter = start(['true'], env);
+        await Bun.sleep(2_200);
+        writeMachine(resolve(root, 'proc'), { availableMb: 40_000, cpuPressure: 1 });
+        const result = await finished(waiter, 8_000);
+        expect(result.code).toBe(0);
+        const entry = jobLog(env).find((line) => line.cmd === 'true') as Record<string, unknown>;
+        const reasons = entry.waitReasons as Record<string, number>;
+        expect(Object.keys(reasons)).toEqual(['memory']);
+        expect(reasons.memory).toBeGreaterThanOrEqual(2);
+        expect(Math.abs(reasons.memory - (entry.waitSeconds as number))).toBeLessThanOrEqual(1);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+});
+
+test('a job admitted at once logs no waitReasons', async () => {
+    const { env } = fixture();
+    expect((await finished(start(['true'], env))).code).toBe(0);
+    const [entry] = jobLog(env);
+    expect(entry.waitSeconds).toBe(0);
+    expect('waitReasons' in entry).toBe(false);
+});
+
+test('a job queued behind another one logs its wait as order', async () => {
+    const { lock, env } = fixture({}, 1, 1);
+    const holder = start(['sleep', '30'], env);
+    try {
+        await waitFor(`${lock}.holder`);
+        const first = start(['true'], env);
+        await Bun.sleep(300);
+        const second = start(['true'], env);
+        await Bun.sleep(1_800);
+        holder.kill('SIGTERM');
+        await finished(holder);
+        expect((await finished(first, 8_000)).code).toBe(0);
+        expect((await finished(second, 8_000)).code).toBe(0);
+        const waited = jobLog(env).filter((line) => line.cmd === 'true');
+        const orders = waited.map((line) => (line.waitReasons as Record<string, number>).order ?? 0);
+        expect(Math.max(...orders)).toBeGreaterThanOrEqual(1);
+    } finally {
+        holder.kill('SIGTERM');
+    }
+});

@@ -53,7 +53,8 @@
 # Every job that acquires a slot appends one JSON line to
 # `${BUILDLOCK_JOB_LOG_DIR:-~/.cache/buildlock}/jobs-YYYY-MM.jsonl` on exit
 # (start/end, class, budget, wait/run seconds, exit code, command, key,
-# peakMb, budgetSource, admission); logging failures are ignored and never
+# peakMb, budgetSource, admission, and waitReasons: seconds waited per blocking
+# reason, only for a job that waited); logging failures are ignored and never
 # change the job's own exit code.
 #
 # Stable interfaces other tools parse: `--status` and `--explain` output, the
@@ -1450,7 +1451,7 @@ cmd_history() {
 
 cmd_stats() {
     local days=30 here=0 limit=15 json=0 needle='' files=() cutoff out rows=() width cmd_w sep=
-    local total_run n fails p50 p90 peak est lane avg_wait key repo cmd summary
+    local total_run n fails p50 p90 peak est lane avg_wait key repo cmd summary reason_rows=()
     while (( $# > 0 )); do
         case "$1" in
             --days) need_value "$@"; days="$2"; shift ;;
@@ -1484,6 +1485,10 @@ cmd_stats() {
             wait = jnum($0, "waitSeconds") + 0
             k = ++n[key]; runs[key, k] = run; trun[key] += run; twait[key] += wait
             if (jnum($0, "exit") != "0") fails[key]++
+            if (match($0, /"waitReasons":\{[^}]*\}/)) {
+                wr = substr($0, RSTART + 15, RLENGTH - 16); np = split(wr, parts, ",")
+                for (q = 1; q <= np; q++) { split(parts[q], kv, ":"); gsub(/"/, "", kv[1]); reason_s[kv[1]] += kv[2] }
+            }
             all++; all_run += run; all_wait += wait; if (jnum($0, "exit") != "0") all_fail++; wait_count[wait]++
         }
         END {
@@ -1507,11 +1512,20 @@ cmd_stats() {
             target = int(0.9 * all); if (0.9 * all > target) target++; seen_n = 0; p90w = 0
             for (i = 1; i <= d; i++) { seen_n += wait_count[dv[i]]; if (seen_n >= target) { p90w = dv[i]; break } }
             printf "#\037%d\037%d\037%d\037%d\037%d\n", all, all_run, all_wait, p90w, all_fail
+            for (rn in reason_s) printf "@\037%s\037%d\n", rn, reason_s[rn]
         }' "${files[@]}" 2>/dev/null)"
     summary="$(grep '^#' <<< "$out" || true)"
-    mapfile -t rows < <(grep -v '^#' <<< "$out" | sort -t $'\x1f' -k1,1nr | head -n "$limit")
-    local all all_run all_wait p90_wait all_fail
+    mapfile -t reason_rows < <(grep '^@' <<< "$out" | sort -t $'\x1f' -k3,3nr || true)
+    mapfile -t rows < <(grep -v '^[#@]' <<< "$out" | sort -t $'\x1f' -k1,1nr | head -n "$limit")
+    local all all_run all_wait p90_wait all_fail reason_name reason_secs reason_json='' reason_text='' reason_sep=''
     IFS=$'\x1f' read -r _ all all_run all_wait p90_wait all_fail <<< "$summary"
+    for row in "${reason_rows[@]}"; do
+        IFS=$'\x1f' read -r _ reason_name reason_secs <<< "$row"
+        [[ -n "$reason_name" ]] || continue
+        reason_json+="${reason_sep:+,}\"$reason_name\":$reason_secs"
+        reason_text+="${reason_sep:+, }$reason_name $(fmt_dur "$reason_secs")"
+        reason_sep=1
+    done
     if (( json == 1 )); then
         printf '{"days":%s,"jobs":%s,"runSeconds":%s,"waitSeconds":%s,"p90WaitSeconds":%s,"failed":%s,"commands":[' "$days" "${all:-0}" "${all_run:-0}" "${all_wait:-0}" "${p90_wait:-0}" "${all_fail:-0}"
         for row in "${rows[@]}"; do
@@ -1520,7 +1534,7 @@ cmd_stats() {
                 "$(json_escape "$key")" "$n" "$fails" "$total_run" "$p50" "$p90" "$peak" "${est:-null}" "$lane" "$avg_wait"
             sep=','
         done
-        printf ']}\n'
+        printf '],"waitReasons":{%s}}\n' "$reason_json"
         return 0
     fi
     if [[ ! "${all:-}" =~ ^[0-9]+$ ]] || (( all == 0 )); then
@@ -1529,6 +1543,7 @@ cmd_stats() {
     fi
     printf '%s%s jobs%s in the last %s days %s ran %s %s waited %s (p90 wait %s) %s %s%% failed\n\n' "$c_bold" "$all" "$c_reset" "$days" "$s_dot" \
         "$(fmt_dur "$all_run")" "$s_dot" "$(fmt_dur "$all_wait")" "$(fmt_dur "$p90_wait")" "$s_dot" $(( all_fail * 100 / all ))
+    [[ -z "$reason_text" ]] || printf 'Waiting by reason: %s\n\n' "$reason_text"
     width="$(term_width)"
     cmd_w=$(( width - 2 - 5 - 5 - 8 - 8 - 8 - 9 - 6 - 8 - 9 ))
     (( cmd_w >= 20 )) || cmd_w=20
@@ -3619,6 +3634,10 @@ main() {
     peak_file=''
     peak_mb=0
     last_wait_reason=''
+    poll_reason=''
+    declare -A wait_us=()
+    wait_mark_us="$queued_us"
+    wait_cat=''
     announced=0
     heavy_waiting=0
 
@@ -3669,12 +3688,16 @@ main() {
         # sandbox that could not see this pid): put it back, same place in line.
         [[ -e "$queue_file" ]] || write_queue_file || true
         scan_queue
+        account_wait
+        was_head=0
         if { [[ "$job_class" == light ]] && [[ "$light_head_pid" == "$self_pid" ]]; } \
             || { [[ "$job_class" != light ]] && [[ "$head_pid" == "$self_pid" ]]; }; then
             # Set before flock: a Ctrl-Z that lands as flock returns must not
             # stop this waiter while it holds the mutex.
             in_sched=1
             started=0
+            was_head=1
+            poll_reason=''
             if flock -w 30 "$sched_fd"; then
                 # Re-check under the mutex; only this lane's head ever takes a slot.
                 scan_queue
@@ -3695,6 +3718,12 @@ main() {
             (( started == 0 )) || break
             if (( pending_stop == 1 )); then pending_stop=0; kill -STOP "$self_pid"; fi
         fi
+        # What blocks this poll: the verdict try_start just got when this job is
+        # its lane's head, else the queue order. A head that lost the mutex keeps
+        # its last category.
+        if (( was_head == 0 )); then wait_cat=order
+        elif [[ -n "$poll_reason" ]]; then wait_category "$poll_reason"
+        else wait_cat="${wait_cat:-order}"; fi
         # One notice once a job has waited 2 seconds, so a person or an agent
         # reading the output knows it is queued, not hung.
         if (( announced == 0 && ${EPOCHREALTIME/[.,]/} - queued_us >= 2000000 )); then
@@ -3723,6 +3752,7 @@ main() {
         printf -v tick '%d.%06d' $(( tick_us / 1000000 )) $(( tick_us % 1000000 ))
         read -r -t "$tick" -u "$tick_fd" _ || true
     done
+    account_wait
     exec {sched_fd}>&-
     if [[ -n "$queue_fd" ]]; then exec {queue_fd}<&-; queue_fd=''; fi
     # From here Ctrl-Z stops buildlock and (in a terminal) the command alike.
@@ -3882,11 +3912,52 @@ stop_sampler() {
     peak_file=''
 }
 
+# Maps a wait_reason verdict to the short name logged in waitReasons. Pure
+# string matching, so a poll costs no extra process.
+wait_category() {
+    case "$1" in
+        'memory: '*|'memory critical: '*|'memory stalling: '*) wait_cat=memory ;;
+        'memory pressure '*) wait_cat='memory-pressure' ;;
+        'all '*' slots busy') wait_cat=slot ;;
+        'last start '*) wait_cat=gap ;;
+        'load '*) wait_cat=load ;;
+        'cpu pressure '*) wait_cat=cpu ;;
+        'io pressure '*) wait_cat=io ;;
+        'swap '*) wait_cat=swap ;;
+        *) wait_cat=other ;;
+    esac
+}
+
+# Credits the time since the last poll to the category that poll found
+# (order until the first verdict), in microseconds.
+account_wait() {
+    local now_us="${EPOCHREALTIME/[.,]/}"
+    (( now_us > wait_mark_us )) || { wait_mark_us="$now_us"; return 0; }
+    wait_us[${wait_cat:-order}]=$(( ${wait_us[${wait_cat:-order}]:-0} + now_us - wait_mark_us ))
+    wait_mark_us="$now_us"
+}
+
+# Prints the waitReasons JSON member (with its leading comma) in whole seconds,
+# or nothing when the job did not wait or no reason reached a second.
+wait_reasons_json() {
+    local name secs sep='' members=''
+    (( $1 > 0 )) || return 0
+    for name in slot memory memory-pressure gap load cpu io swap order other; do
+        secs=$(( (${wait_us[$name]:-0} + 500000) / 1000000 ))
+        (( secs > 0 )) || continue
+        members+="$sep\"$name\":$secs"
+        sep=','
+    done
+    [[ -z "$members" ]] || printf ',"waitReasons":{%s}' "$members"
+}
+
 # Appends one job-log line when this process actually acquired a slot;
 # logging failures are ignored and never change the job's own exit code.
 write_job_log() {
     [[ -n "$my_slot" && -n "$job_started" ]] || return 0
-    local log_file start_iso end_iso cmd
+    local log_file start_iso end_iso cmd wait_s reasons
+    wait_s=$(( job_started - queued_at ))
+    reasons="$(wait_reasons_json "$wait_s")"
     mkdir -p "$job_log_dir" 2>/dev/null || return 0
     TZ=UTC printf -v log_file '%s/jobs-%(%Y-%m)T.jsonl' "$job_log_dir" -1
     TZ=UTC printf -v start_iso '%(%Y-%m-%dT%H:%M:%SZ)T' "$job_started"
@@ -3895,10 +3966,10 @@ write_job_log() {
     cmd="${cmd:0:200}"
     (
         flock -w 2 9 || exit 0
-        printf '{"at":"%s","end":"%s","pid":%s,"cwd":"%s","class":"%s","budgetMb":%s,"waitSeconds":%s,"runSeconds":%s,"exit":%s,"cmd":"%s","key":"%s","peakMb":%s,"budgetSource":"%s","admission":"%s"}\n' \
+        printf '{"at":"%s","end":"%s","pid":%s,"cwd":"%s","class":"%s","budgetMb":%s,"waitSeconds":%s,"runSeconds":%s,"exit":%s,"cmd":"%s","key":"%s","peakMb":%s,"budgetSource":"%s","admission":"%s"%s}\n' \
             "$start_iso" "$end_iso" "$self_pid" "$(json_escape "$PWD")" "$my_class" "$job_memory_mb" \
-            "$(( job_started - queued_at ))" "$(( EPOCHSECONDS - job_started ))" "${command_result:-0}" "$(json_escape "$cmd")" \
-            "$(json_escape "$job_key")" "${peak_mb:-0}" "$budget_source" "${admission_mode:-free}" >&9
+            "$wait_s" "$(( EPOCHSECONDS - job_started ))" "${command_result:-0}" "$(json_escape "$cmd")" \
+            "$(json_escape "$job_key")" "${peak_mb:-0}" "$budget_source" "${admission_mode:-free}" "$reasons" >&9
     ) 2>/dev/null 9>>"$log_file" || true
 }
 cleanup() {
@@ -4040,7 +4111,7 @@ try_start() {
         scan_limit="$light_slots"
         (( idle == 0 )) || scan_limit="$light_max_jobs"
         reason="$(light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
-        if [[ -n "$reason" ]]; then last_wait_reason="$reason"; return 1; fi
+        if [[ -n "$reason" ]]; then last_wait_reason="$reason"; poll_reason="$reason"; return 1; fi
         admission_mode=free
         (( idle == 0 )) || ! needs_idle_path "$light_count" "$light_slots" 1 || admission_mode=idle
         for (( slot = 0; slot < scan_limit; slot++ )); do
@@ -4057,6 +4128,7 @@ try_start() {
             exec {fd}>&-
         done
         last_wait_reason="all $scan_limit light slots busy"
+        poll_reason="$last_wait_reason"
         return 1
     fi
     scan_limit="$slots"
@@ -4064,6 +4136,7 @@ try_start() {
     reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
     if [[ -n "$reason" ]]; then
         last_wait_reason="$reason"
+        poll_reason="$reason"
         # Waiting on memory: publish it once, for heavy_wait_reserve.
         if [[ "$reason" == 'memory: '* && "$heavy_waiting" == 0 ]]; then
             printf '%s\t%s\t%s\n' "$self_pid" "$EPOCHSECONDS" "$job_memory_mb" > "$(heavy_wait_file).$self_pid.tmp" 2>/dev/null \
@@ -4092,6 +4165,7 @@ try_start() {
         exec {fd}>&-
     done
     last_wait_reason="all $scan_limit slots busy"
+    poll_reason="$last_wait_reason"
     return 1
 }
 

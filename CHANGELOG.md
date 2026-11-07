@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The job log says why a job waited: `waitReasons` holds the seconds spent on each blocking reason (`slot`, `memory`, `memory-pressure`, `gap`, `load`, `cpu`, `io`, `swap`, `order` for a job queued behind an earlier one, `other`), taken from the verdict `--status` shows. It appears only on a line with a wait; older lines and readers are unaffected. `buildlock stats` (and `stats --json`, as a trailing `waitReasons` member) totals them.
+
 ## 0.2.2
 
 - On npm: `npm install -g buildlock` (or pnpm, bun). The package is the same script; releases publish it from GitHub Actions with provenance.

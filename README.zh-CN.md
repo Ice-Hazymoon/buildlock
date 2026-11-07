@@ -260,7 +260,7 @@ fi
 - **`buildlock status --json`、`buildlock stats --json`：** 通道、在跑和排队的任务、机器指标；每条命令的统计。
 - **`buildlock --explain <cmd>`：** key、样本数、画像、通道和预算、结论。
 - **stderr 上的 `buildlock: waited Ns`：** 需要等待的任务开始时打印。不用等待的任务什么都不打印，解析时把缺失当作 0。
-- **任务日志：** `~/.cache/buildlock/jobs-YYYY-MM.jsonl`，JSON Lines，每个结束的任务一行：`at`、`end`、`pid`、`cwd`、`class`、`budgetMb`、`waitSeconds`、`runSeconds`、`exit`、`cmd`、`key`、`peakMb`、`budgetSource`、`admission`。`buildlock history --json` 会原样输出。
+- **任务日志：** `~/.cache/buildlock/jobs-YYYY-MM.jsonl`，JSON Lines，每个结束的任务一行：`at`、`end`、`pid`、`cwd`、`class`、`budgetMb`、`waitSeconds`、`runSeconds`、`exit`、`cmd`、`key`、`peakMb`、`budgetSource`、`admission`，等过的任务还有 `waitReasons`（按阻塞原因统计的等待秒数：`slot`、`memory`、`memory-pressure`、`gap`、`load`、`cpu`、`io`、`swap`、`order`）。`buildlock history --json` 会原样输出；`buildlock stats` 汇总各原因。
 - **环境变量：** `BUILDLOCK_CLASS=light|heavy`、`BUILDLOCK_JOB_MEMORY_MB`、`BUILDLOCK_TIMEOUT`、`BUILDLOCK_BYPASS`。隔离测试用：`BUILDLOCK_LOCK_PATH`、`BUILDLOCK_JOB_LOG_DIR`、`BUILDLOCK_CONFIG=`（不读配置）。
 
 ## 常见问题

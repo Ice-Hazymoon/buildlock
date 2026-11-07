@@ -303,7 +303,7 @@ These interfaces are stable across versions:
 - **`buildlock status --json`** and **`buildlock stats --json`.** Lanes, running and queued jobs and machine metrics; per-command statistics.
 - **`buildlock --explain <cmd>`.** Key, samples, profile, class and budget, verdict.
 - **The `buildlock: waited Ns` line** on stderr when a job that had to wait starts. A job that starts at once prints nothing, so treat a missing line as 0.
-- **The job log.** JSON Lines in `~/.cache/buildlock/jobs-YYYY-MM.jsonl`, one line per finished job: `at`, `end`, `pid`, `cwd`, `class`, `budgetMb`, `waitSeconds`, `runSeconds`, `exit`, `cmd`, `key`, `peakMb`, `budgetSource`, `admission`. `buildlock history --json` prints them.
+- **The job log.** JSON Lines in `~/.cache/buildlock/jobs-YYYY-MM.jsonl`, one line per finished job: `at`, `end`, `pid`, `cwd`, `class`, `budgetMb`, `waitSeconds`, `runSeconds`, `exit`, `cmd`, `key`, `peakMb`, `budgetSource`, `admission`, and, for a job that waited, `waitReasons` (seconds per blocking reason: `slot`, `memory`, `memory-pressure`, `gap`, `load`, `cpu`, `io`, `swap`, `order`). `buildlock history --json` prints them; `buildlock stats` totals the reasons.
 - **Environment variables.** `BUILDLOCK_CLASS=light|heavy`, `BUILDLOCK_JOB_MEMORY_MB`, `BUILDLOCK_TIMEOUT`, `BUILDLOCK_BYPASS`. For isolated tests: `BUILDLOCK_LOCK_PATH`, `BUILDLOCK_JOB_LOG_DIR`, `BUILDLOCK_CONFIG=` (no config).
 
 ## Troubleshooting

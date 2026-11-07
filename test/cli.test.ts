@@ -547,6 +547,21 @@ test('history and stats line up with older log lines and new commands', () => {
     expect(run(['stats'], env).stdout).toMatch(/\bnew\b.*r: make/);
 });
 
+test('history and stats read lines with and without waitReasons', () => {
+    const { env } = sandbox();
+    mkdirSync(env.BUILDLOCK_JOB_LOG_DIR, { recursive: true });
+    const month = new Date().toISOString().slice(0, 7);
+    const at = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    const line = (extra: string) => `{"at":"${at}","end":"${at}","pid":1,"cwd":"/r","class":"heavy","budgetMb":8192,"waitSeconds":100,"runSeconds":5,"exit":0,"cmd":"make","key":"/r::make","peakMb":10,"budgetSource":"default","admission":"free"${extra}}\n`;
+    writeFileSync(resolve(env.BUILDLOCK_JOB_LOG_DIR, `jobs-${month}.jsonl`),
+        line(',"waitReasons":{"slot":30,"memory":70}') + line(',"waitReasons":{"memory":100}')
+        + `{"at":"${at}","end":"${at}","pid":2,"cwd":"/r","class":"heavy","budgetMb":8192,"waitSeconds":3,"runSeconds":5,"exit":0,"cmd":"make","key":"/r::make"}\n`);
+    expect(run(['history'], env).stdout.match(/make$/gm)).toHaveLength(3);
+    expect(run(['stats'], env).stdout).toContain('Waiting by reason: memory 2m50s, slot 30s');
+    expect(JSON.parse(run(['stats', '--json'], env).stdout).waitReasons).toEqual({ memory: 170, slot: 30 });
+    expect(JSON.parse(run(['history', '--json'], env).stdout.trim().split('\n')[0]).waitSeconds).toBeDefined();
+});
+
 test('update replaces the installed file after checking its checksum', () => {
     const { env, root } = sandbox();
     const bin = resolve(root, 'bin');
