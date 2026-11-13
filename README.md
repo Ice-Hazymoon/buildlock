@@ -20,7 +20,7 @@ buildlock cargo build --release
 - **One word in front of the command.** No daemon, no service, no config needed. It is a single bash script, and a job that starts at once prints nothing of its own.
 - **Admits by real headroom.** A free slot, load, CPU, IO and memory pressure, free memory, and how much memory the jobs that just started may still need.
 - **Learns each command.** Peak memory and run time are recorded per repository and command. From the third run on, the memory reserved for a command is the measured figure instead of a guess, and small, fast commands move to a separate light lane.
-- **Fair.** Jobs start in arrival order, and a heavy job that waits for memory gets it kept free, so a stream of small jobs cannot starve it.
+- **Fair.** Jobs start in arrival order, and a heavy job that waits for memory gets it kept free, so a stream of small jobs cannot starve it. Short jobs whose run time is known may start around a job that waits for memory, and memory held outside buildlock does not block the queue forever.
 - **Transparent.** Ctrl-C, Ctrl-Z, password prompts and window resizes work as without it; signals reach the command once, and it may clean up before it exits.
 - **Teaches your coding agents.** `buildlock agents install` adds a short section to the instructions of Claude Code, Codex, Gemini CLI, Copilot, opencode, Cursor and more than a dozen others, so every session learns to use it.
 - **Quiet hours.** Run fewer jobs at night, or whenever your own condition says so.
@@ -175,7 +175,7 @@ Details:
 
 ## How it decides
 
-1. **Order.** Jobs wait in arrival order, in one of two lanes. *Heavy* jobs (builds, type-checks, test suites) take a heavy slot; *light* jobs (quick checks under about 2 GB and 3 minutes) have a separate pool, so they don't queue behind a long build.
+1. **Order.** Jobs wait in arrival order, in one of two lanes. *Heavy* jobs (builds, type-checks, test suites) take a heavy slot; *light* jobs (quick checks under about 2 GB and 3 minutes, or under `LIGHT_SHORT_MAX_MB`, 5 GB on a large machine, when they usually finish within a minute; those above 2 GB still keep the start gap) have a separate pool, so they don't queue behind a long build.
 2. **Room.** The first job in a lane starts when nothing runs. Beside running jobs, a job starts only when all of these hold:
    - a slot is free (`cores / WORKERS` heavy slots, `cores / 4` light slots);
    - 20 seconds have passed since the last heavy start, so that job's load shows first;
@@ -184,9 +184,15 @@ Details:
    - after reserving this job's memory and what recently started jobs may still grow into, `RESERVE_MEMORY_MB` stays free.
 3. **Memory budgets.** Every job's peak memory and run time go to a log (`~/.cache/buildlock/jobs-YYYY-MM.jsonl`). From the third run of the same command in the same repository, its budget is the p90 peak × 1.25 + 256 MB. Until then it is the declared `--memory`, or a default: a quarter of the RAM (at most 8 GB) for heavy jobs, 1.5 GB for light ones. Worktrees of one repository share their history.
 4. **No starving.** A heavy job that has waited a minute for memory has light jobs keep its budget free too, instead of taking every bit that frees up.
-5. **Idle machine.** When expected load is under half the cores and pressure is low, the start gap is skipped and up to `cores / 4` heavy jobs may run. Memory checks always apply.
-6. **Critical memory.** Below a tenth of the RAM available (at most 3 GB), or under heavy memory stalls, nothing starts, not even a lone job.
-7. **Nesting.** A buildlock call inside a running job (a script that calls `buildlock` again) runs straight through instead of deadlocking, also when a wrapper such as `env -i` or turbo's strict env mode drops `BUILDLOCK_HELD`. Copying the environment variable to another process does not let that process skip the queue.
+5. **Backfill.** While the first heavy job waits for memory, a later heavy job may start ahead of it if it passes every check on its own (slots, load, pressure, memory with the reserve) and has a learned run time (p90 of at least 3 runs) of at most `BACKFILL_MAX_SECONDS` (2 minutes). Commands without that history never backfill, and the candidates keep their own arrival order: only the oldest one may try. After `HEAVY_STARVE_SECONDS` (a minute) the waiting job is protected and backfill stops, unless it is hopeless: nothing is starting up, and even the relaxed check below would not fit it, so only memory outside buildlock's jobs can help it. Only one backfilled job runs at a time, and while it runs the waiting job stays protected, so it gets a clean check between any two of them.
+6. **Memory held elsewhere.** A heavy job that has waited `MEMORY_RELAX_SECONDS` (5 minutes) for memory while no job of either lane is starting up and would still not fit with the full reserve once buildlock's running jobs ended, is waiting for memory buildlock does not account for (dev servers, browsers, editors). It then needs only `CRITICAL_MEMORY_MB` free after its budget instead of `RESERVE_MEMORY_MB`. `status` and `explain` say when this applies; `0` turns it off.
+7. **Idle machine.** When expected load is under half the cores and pressure is low, the start gap is skipped and up to `cores / 4` heavy jobs may run. Memory checks always apply.
+8. **Critical memory.** Below a tenth of the RAM available (at most 3 GB), or under heavy memory stalls, nothing starts, not even a lone job.
+9. **Nesting.** A buildlock call inside a running job (a script that calls `buildlock` again) runs straight through instead of deadlocking, also when a wrapper such as `env -i` or turbo's strict env mode drops `BUILDLOCK_HELD`. Copying the environment variable to another process does not let that process skip the queue.
+
+**Stalled jobs.** A running job whose processes used under `STALL_CPU_SECONDS` (5) of CPU in the last `STALL_SECONDS` (30 minutes), such as a test runner hung on a worker, is marked `stalled` in `status` and `doctor`. buildlock never stops it: it keeps its slot, since it may be waiting on something and resume, and a build that works through a daemon (Gradle, Bazel, Docker) looks the same.
+
+**A caller that goes away.** A queued job whose caller exits (a killed shell, an agent's timed-out tool call) leaves the queue with exit code 74 instead of running later for nobody: the parent pid it started with has changed, whether it was reparented to init or to a subreaper such as `systemd --user`. A running job is never affected. `BUILDLOCK_KEEP_ORPHANS=1` keeps such jobs queued; so do `nohup`, `setsid` and output redirected to a file of its own (`buildlock make > build.log &`), since someone can still read the result; output it shares with the caller, such as an agent tool's output file, does not count.
 
 **The command itself.** In a terminal the command runs in buildlock's own process group, so the terminal reaches it as usual: Ctrl-C, Ctrl-Z and Ctrl-\, window resizes, and `/dev/tty` for sudo, ssh or gpg prompts. Ctrl-C in a loop stops the loop. Elsewhere (coding agents, CI, pipes) it gets a session of its own, and buildlock passes HUP, INT, QUIT and TERM on to its whole process tree, once; the command may clean up before it exits, and a second signal kills it. Whatever the command leaves running in that session is stopped when it exits, and the slot is released only then. If buildlock itself is killed with `kill -9`, a watchdog stops the command it leaves behind within a couple of seconds. A Ctrl-Z while queued lets the jobs behind it go first.
 
@@ -212,7 +218,7 @@ buildlock exports `BUILDLOCK_WORKERS`, the cores one heavy job is assumed to use
 
 Every command takes `--help`. A program whose name matches a subcommand (`status`, `run`, `log`, ...) runs with `buildlock run -- status`. `--memory` takes megabytes or a size such as `512M` or `2G`.
 
-Exit codes are the command's own. Additionally, 73 means it gave up waiting (`--timeout` / `BUILDLOCK_TIMEOUT`) and the command never ran, 126 that it is not executable and 127 that it was not found (both checked before queueing), and 129, 130, 131 and 143 that it was cancelled by HUP, INT, QUIT or TERM while queued.
+Exit codes are the command's own. Additionally, 73 means it gave up waiting (`--timeout` / `BUILDLOCK_TIMEOUT`) and the command never ran, 74 that its caller exited while it was queued and the command never ran, 126 that it is not executable and 127 that it was not found (both checked before queueing), and 129, 130, 131 and 143 that it was cancelled by HUP, INT, QUIT or TERM while queued.
 
 Shell completion:
 
@@ -244,6 +250,11 @@ BUILDLOCK_SLOTS=1 buildlock npm test
 | `CRITICAL_MEMORY_MB` | RAM / 10, at most 3072 | below this, nothing starts |
 | `DEFAULT_MEMORY_MB` | RAM / 4, at most 8192 | budget of a heavy command with no history |
 | `START_GAP` | 20 | seconds between heavy starts |
+| `LIGHT_SHORT_MAX_MB`, `LIGHT_SHORT_MAX_SECONDS` | RAM / 8 (at most 5120), 60 | a command learned to need at most this much and to finish within this long takes the light lane |
+| `BACKFILL_MAX_SECONDS` | 120 | a heavy command learned to finish within this long may start ahead of a heavy job waiting for memory (0: never) |
+| `MEMORY_RELAX_SECONDS` | 300 | after this long waiting for memory held outside buildlock, a heavy job needs only `CRITICAL_MEMORY_MB` free after it (0: never) |
+| `STALL_SECONDS`, `STALL_CPU_SECONDS` | 1800, 5 | a running job that used under this much CPU in this long shows as stalled |
+| `KEEP_ORPHANS` | auto | `on` runs a queued job whose caller exited; `auto` does that under `nohup` or `setsid`, or when its output goes to a file of its own |
 | `LOAD_MAX` | cores × 1.25 | load ceiling for starting beside other jobs |
 | `CORES` | `nproc` | cores to plan for (set it in containers and WSL) |
 | `BYPASS` | off | run commands at once, without queueing |
@@ -297,18 +308,21 @@ These interfaces are stable across versions:
 - **`buildlock --status`.** One line per job (`holder none` when nothing runs), then a summary line:
   ```text
   holder pid=1234 age=12s worktree=/path slot=0 class=heavy
+  holder pid=1236 age=36012s worktree=/path slot=1 class=heavy stalled=35400s
   queued pid=1240 age=3s worktree=/path class=heavy
-  scheduler running=1/4 next=start light=0/8 idle=yes expected_load=9.00 max=8 light_max=16
+  scheduler running=2/4 next=start light=0/8 idle=yes expected_load=9.00 max=8 light_max=16 relaxed=no backfill=no
   ```
-- **`buildlock status --json`** and **`buildlock stats --json`.** Lanes, running and queued jobs and machine metrics; per-command statistics.
-- **`buildlock --explain <cmd>`.** Key, samples, profile, class and budget, verdict.
+  `stalled=` appears only on a stalled job. `relaxed=yes` means the heavy verdict comes from the relaxed memory check, `backfill=yes` that short heavy jobs may start past the job waiting for memory; the verdict is judged for that job's own budget.
+- **`buildlock status --json`** and **`buildlock stats --json`.** Lanes (the heavy lane with `memoryRelaxed` and `backfill`), running jobs (with `stalledSeconds`, `null` unless stalled), queued jobs and machine metrics; per-command statistics, wait reasons and `admissions` (starts by admission mode).
+- **`buildlock --explain <cmd>`.** Key, samples, profile, class and budget, verdict, then `backfill:` (whether it may backfill, and why not) and `relaxed:` (what the relaxed memory check would say after `MEMORY_RELAX_SECONDS`).
 - **The `buildlock: waited Ns` line** on stderr when a job that had to wait starts. A job that starts at once prints nothing, so treat a missing line as 0.
-- **The job log.** JSON Lines in `~/.cache/buildlock/jobs-YYYY-MM.jsonl`, one line per finished job: `at`, `end`, `pid`, `cwd`, `class`, `budgetMb`, `waitSeconds`, `runSeconds`, `exit`, `cmd`, `key`, `peakMb`, `budgetSource`, `admission`, and, for a job that waited, `waitReasons` (seconds per blocking reason: `slot`, `memory`, `memory-pressure`, `gap`, `load`, `cpu`, `io`, `swap`, `order`). `buildlock history --json` prints them; `buildlock stats` totals the reasons.
+- **The job log.** JSON Lines in `~/.cache/buildlock/jobs-YYYY-MM.jsonl`, one line per finished job: `at`, `end`, `pid`, `cwd`, `class`, `budgetMb`, `waitSeconds`, `runSeconds`, `exit`, `cmd`, `key`, `peakMb`, `budgetSource`, `admission` (`free`, `idle` for the idle fast path, `backfill`, or `memory-relaxed`), and, for a job that waited, `waitReasons` (seconds per blocking reason: `slot`, `memory`, `memory-pressure`, `gap`, `load`, `cpu`, `io`, `swap`, `order`). `buildlock history --json` prints them; `buildlock stats` totals the reasons.
 - **Environment variables.** `BUILDLOCK_CLASS=light|heavy`, `BUILDLOCK_JOB_MEMORY_MB`, `BUILDLOCK_TIMEOUT`, `BUILDLOCK_BYPASS`. For isolated tests: `BUILDLOCK_LOCK_PATH`, `BUILDLOCK_JOB_LOG_DIR`, `BUILDLOCK_CONFIG=` (no config).
 
 ## Troubleshooting
 
 - **A job always waits.** `buildlock status` says why, in plain words, for both lanes; `buildlock doctor` shows the limits in effect.
+- **A job holds its slot for hours.** `buildlock status` and `buildlock doctor` mark a job `stalled` when its processes have stopped using CPU; check it and stop it with `kill <pid>` (buildlock passes the signal to the whole command).
 - **"command not found" for something that works in your shell.** It is an alias or a function; see [Shells, containers and WSL](#shells-containers-and-wsl).
 - **Settings don't take.** `buildlock config list` shows each value and its source (default, config, quiet, env); `buildlock doctor` points at a broken config file.
 - **An agent doesn't use it.** `buildlock agents status`, then restart the agent's session: they read their instructions when a session starts.

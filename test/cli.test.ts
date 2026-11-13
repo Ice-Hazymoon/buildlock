@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -93,7 +93,9 @@ test('an unknown command fails fast with 127 and suggests a subcommand', () => {
 });
 
 test('config set, get, list and unset round-trip through the managed block', () => {
-    const { env, config } = sandbox();
+    // Quiet mode forced off: the 22-06 hours set below would otherwise swap in the quiet limits at night.
+    const { env: base, config } = sandbox();
+    const env = { ...base, BUILDLOCK_QUIET: 'off' };
     expect(run(['config', 'set', 'slots', '3'], env).code).toBe(0);
     expect(run(['config', 'set', 'QUIET_HOURS', '22-06'], env).code).toBe(0);
     expect(run(['config', 'get', 'SLOTS'], env).stdout).toBe('3\n');
@@ -950,4 +952,170 @@ test('install.sh points a package manager copy back to it', () => {
     const result = spawnSync('bash', [installer, '--from', script, '--prefix', resolve(root, 'bin'), '--yes'], { env, encoding: 'utf8' });
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('npm install -g buildlock@latest');
+});
+
+test('a running job whose processes stop using CPU shows as stalled, and keeps its slot', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '2', BUILDLOCK_SAMPLE_SECONDS: '0.5', BUILDLOCK_STALL_SECONDS: '2', BUILDLOCK_STALL_CPU_SECONDS: '1' });
+    const idle = spawn(script, ['sleep', '30'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const busy = spawn(script, ['bash', '-c', 'end=$((SECONDS + 7)); while (( SECONDS < end )); do :; done'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.slot1.holder`);
+        await Bun.sleep(4_000);
+        const stable = run(['--status'], env).stdout;
+        expect(stable).toMatch(new RegExp(`holder pid=${idle.pid} .* class=heavy stalled=\\d+s\\n`));
+        expect(stable).toMatch(new RegExp(`holder pid=${busy.pid} .* class=heavy\\n`));
+        expect(stable).toContain('running=2/2');
+        expect(run(["status"], env).stdout).toContain("looks like this too); it keeps its slot");
+        const json = JSON.parse(run(['status', '--json'], env).stdout);
+        expect(json.running.find((job: { pid: number }) => job.pid === idle.pid).stalledSeconds).toBeGreaterThanOrEqual(2);
+        expect(json.running.find((job: { pid: number }) => job.pid === busy.pid).stalledSeconds).toBeNull();
+        expect(run(['doctor'], env).stdout).toMatch(new RegExp(`pid ${idle.pid} \\(sleep 30\\) stalled`));
+        expect((await finished(busy, 10_000)).code).toBe(0);
+    } finally {
+        idle.kill('SIGTERM');
+        await finished(idle);
+    }
+    expect(existsSync(`${env.BUILDLOCK_LOCK_PATH}.active.${idle.pid}`)).toBe(false);
+}, 20_000);
+
+/** Runs `bash -c script` under a python3 child subreaper (as systemd --user is), printing "pid status" for each process it reaps. */
+function subreaper(bashScript: string, env: Record<string, string>) {
+    const python = `
+import ctypes, os, sys
+ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)
+pid = os.fork()
+if pid == 0:
+    os.execvp('bash', ['bash', '-c', sys.argv[1]])
+print('bash', pid, flush=True)
+while True:
+    try:
+        p, status = os.wait()
+    except ChildProcessError:
+        break
+    print('reaped', p, os.waitstatus_to_exitcode(status), flush=True)
+`;
+    const child = spawn('python3', ['-c', python, bashScript], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (chunk) => { out += String(chunk); });
+    child.stderr.on('data', (chunk) => { err += String(chunk); });
+    return { closed: once(child, 'close'), output: () => out, stderr: () => err };
+}
+
+async function until(check: () => boolean, ms = 5_000): Promise<void> {
+    for (let waited = 0; waited < ms; waited += 50) {
+        if (check()) return;
+        await Bun.sleep(50);
+    }
+    throw new Error('Timed out');
+}
+
+function queuedPids(env: Record<string, string>): string[] {
+    const dir = `${env.BUILDLOCK_LOCK_PATH}.queue`;
+    return existsSync(dir) ? readdirSync(dir).filter((name) => /^\d+$/.test(name)) : [];
+}
+
+test('a queued job whose caller exits leaves the queue with 74, also when reparented to a subreaper', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1', S: script });
+    const holder = spawn(script, ['sleep', '30'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const { closed, output, stderr } = subreaper('"$S" true; echo never', env);
+        await until(() => queuedPids(env).length === 1 && /^bash \d+$/m.test(output()));
+        const waiter = queuedPids(env)[0];
+        const bash = Number(/^bash (\d+)$/m.exec(output())?.[1]);
+        expect(Number.isInteger(bash) && bash > 1).toBe(true);
+        process.kill(bash, 'SIGKILL');
+        await until(() => output().includes(`reaped ${waiter} `));
+        expect(output()).toContain(`reaped ${waiter} 74`);
+        expect(queuedPids(env)).toEqual([]);
+        await closed;
+        expect(stderr()).toContain(`the caller (pid ${bash}) exited while this job was queued`);
+        expect(output()).not.toContain('never');
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('BUILDLOCK_KEEP_ORPHANS keeps an orphaned waiter, and a running job is never affected', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1', S: script });
+    const first = subreaper('"$S" sleep 1.5; :', env);
+    await until(() => existsSync(`${env.BUILDLOCK_LOCK_PATH}.holder`) && /^bash \d+$/m.test(first.output()));
+    const running = readFileSync(`${env.BUILDLOCK_LOCK_PATH}.holder`, 'utf8').split('\t')[0];
+    const second = subreaper('"$S" true; :', { ...env, BUILDLOCK_KEEP_ORPHANS: '1' });
+    await until(() => queuedPids(env).length === 1 && /^bash \d+$/m.test(second.output()));
+    const waiter = queuedPids(env)[0];
+    // Kill both callers: the running job finishes, the kept waiter runs after it.
+    for (const out of [first.output(), second.output()]) process.kill(Number(/^bash (\d+)$/m.exec(out)?.[1]), 'SIGKILL');
+    await Bun.sleep(1_000);
+    expect(queuedPids(env)).toEqual([waiter]);
+    await until(() => second.output().includes(`reaped ${waiter} `), 8_000);
+    expect(second.output()).toContain(`reaped ${waiter} 0`);
+    await first.closed;
+    expect(first.output()).toContain(`reaped ${running} 0`);
+    await second.closed;
+}, 20_000);
+
+test('auto keeps an orphaned waiter whose output goes to a file someone can read later', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1', S: script });
+    const out = resolve(env.HOME, 'job.log');
+    const holder = spawn(script, ['sleep', '2'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const { closed, output } = subreaper(`"$S" echo done > "${out}" 2>&1; :`, env);
+        await until(() => queuedPids(env).length === 1 && /^bash \d+$/m.test(output()));
+        const waiter = queuedPids(env)[0];
+        process.kill(Number(/^bash (\d+)$/m.exec(output())?.[1]), 'SIGKILL');
+        await until(() => output().includes(`reaped ${waiter} `), 8_000);
+        expect(output()).toContain(`reaped ${waiter} 0`);
+        expect(readFileSync(out, 'utf8')).toContain('done');
+        await closed;
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('an orphan that shares its caller\'s output file (as an agent tool call does) still leaves the queue', async () => {
+    const { env } = sandbox({ BUILDLOCK_SLOTS: '1', S: script });
+    const out = resolve(env.HOME, 'tool.output');
+    const holder = spawn(script, ['sleep', '30'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+        await waitFor(`${env.BUILDLOCK_LOCK_PATH}.holder`);
+        const { closed, output } = subreaper(`exec > "${out}" 2>&1; "$S" true; :`, env);
+        await until(() => queuedPids(env).length === 1 && /^bash \d+$/m.test(output()));
+        const waiter = queuedPids(env)[0];
+        process.kill(Number(/^bash (\d+)$/m.exec(output())?.[1]), 'SIGKILL');
+        await until(() => output().includes(`reaped ${waiter} `), 8_000);
+        expect(output()).toContain(`reaped ${waiter} 74`);
+        await closed;
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('stats counts backfilled and memory-relaxed starts', () => {
+    const { env } = sandbox();
+    mkdirSync(env.BUILDLOCK_JOB_LOG_DIR, { recursive: true });
+    const month = new Date().toISOString().slice(0, 7);
+    const at = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    const line = (admission: string) => `{"at":"${at}","end":"${at}","pid":1,"cwd":"/r","class":"heavy","budgetMb":8192,"waitSeconds":3,"runSeconds":5,"exit":0,"cmd":"make","key":"/r::make","peakMb":10,"budgetSource":"default","admission":"${admission}"}\n`;
+    writeFileSync(resolve(env.BUILDLOCK_JOB_LOG_DIR, `jobs-${month}.jsonl`), line('free') + line('backfill') + line('backfill') + line('memory-relaxed'));
+    expect(run(['stats'], env).stdout).toContain('Starts around memory waits: backfill 2, memory-relaxed 1');
+    expect(JSON.parse(run(['stats', '--json'], env).stdout).admissions).toEqual({ backfill: 2, free: 1, 'memory-relaxed': 1 });
+});
+
+test('the new settings are listed and validated', () => {
+    const { env } = sandbox();
+    const rows = run(['config', 'list', '--tsv'], env).stdout;
+    for (const key of ['LIGHT_SHORT_MAX_MB', 'LIGHT_SHORT_MAX_SECONDS', 'BACKFILL_MAX_SECONDS', 'MEMORY_RELAX_SECONDS', 'STALL_SECONDS', 'STALL_CPU_SECONDS', 'KEEP_ORPHANS']) {
+        expect(rows).toContain(`${key}\t`);
+    }
+    expect(run(['config', 'get', 'LIGHT_SHORT_MAX_MB'], env).stdout).toBe('5120\n');
+    expect(run(['config', 'set', 'STALL_SECONDS', '0'], env).code).not.toBe(0);
+    expect(run(['config', 'set', 'KEEP_ORPHANS', 'maybe'], env).code).not.toBe(0);
+    expect(run(['config', 'set', 'KEEP_ORPHANS', 'on'], env).code).toBe(0);
 });

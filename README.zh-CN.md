@@ -20,7 +20,7 @@ buildlock cargo build --release
 - **只需加一个前缀。** 没有守护进程，没有服务，也不需要配置，整个工具就是一个 bash 脚本。不用排队的任务，buildlock 自己一行字都不输出。
 - **按真实余量放行。** 看是否有空槽位、负载、CPU / IO / 内存压力、可用内存，以及刚启动的任务还会再涨多少内存。
 - **会学习每条命令。** 按「仓库 + 命令」记录峰值内存和耗时。从第三次运行起，按实测值预留内存，不再靠猜；又小又快的命令会自动进入轻量通道。
-- **公平。** 按到达顺序启动。重任务等内存等久了，轻任务会给它把内存留出来，不会被源源不断的小任务饿死。
+- **公平。** 按到达顺序启动。重任务等内存等久了，轻任务会给它把内存留出来，不会被源源不断的小任务饿死。已知耗时很短的任务可以绕过正在等内存的任务先跑；被 buildlock 之外的进程占住的内存也不会让队列永远卡住。
 - **透明。** Ctrl-C、Ctrl-Z、密码提示、调整窗口大小都和直接运行时一样；信号只送达命令一次，命令可以先做完清理再退出。
 - **教会 AI 编码工具使用它。** `buildlock agents install` 会往 Claude Code、Codex、Gemini CLI、Copilot、opencode、Cursor 等二十来种工具的说明文件里加一小段说明，每个会话自然就会用它。
 - **安静时段。** 夜间（或满足你自定义的条件时）少跑一些任务。
@@ -137,7 +137,7 @@ buildlock agents uninstall
 
 ## 调度规则
 
-1. **两条通道，按序排队。** 任务按到达顺序排队，分属两条通道。重任务占重任务槽位；轻任务（约 2 GB、3 分钟以内）有自己的槽位池，不用排在长构建后面。
+1. **两条通道，按序排队。** 任务按到达顺序排队，分属两条通道。重任务占重任务槽位；轻任务（约 2 GB、3 分钟以内；通常一分钟内跑完的命令放宽到 `LIGHT_SHORT_MAX_MB`，大内存机器上是 5 GB，超过 2 GB 的仍遵守启动间隔）有自己的槽位池，不用排在长构建后面。
 2. **按余量放行。** 什么都没在跑时，排在最前的任务直接开始。已有任务在跑时，要同时满足以下条件才能启动：
    - 有空槽位（`cores / WORKERS` 个重任务槽位，`cores / 4` 个轻任务槽位）；
    - 距上一个重任务启动已过 20 秒，让它的负载先显现出来；
@@ -146,9 +146,15 @@ buildlock agents uninstall
    - 预留本任务的内存、以及刚启动的任务还会再涨的内存之后，仍剩 `RESERVE_MEMORY_MB`。
 3. **内存预算。** 每个任务的峰值内存和耗时都写入日志 `~/.cache/buildlock/jobs-YYYY-MM.jsonl`。同一仓库的同一条命令跑满三次后，预算取 p90 峰值 × 1.25 + 256 MB；在那之前用 `--memory`，或默认值：重任务取内存的四分之一（最多 8 GB），轻任务 1.5 GB。同一仓库的各个 worktree 共享历史。
 4. **不会饿死。** 重任务等内存超过一分钟后，轻任务也要给它把预算留出来，不能把腾出来的内存全部占走。
-5. **机器空闲时：** 不再等启动间隔，最多可以跑 `cores / 4` 个重任务。内存检查始终生效。
-6. **内存告急时：** 可用内存低于总内存的十分之一（最多 3 GB），或内存压力（PSI full）过高时，什么都不启动，哪怕只有一个任务。
-7. **嵌套调用：** 任务内部再次调用 buildlock 会直接放行，不会死锁；即使 `env -i`、turbo 严格环境模式之类的包装丢掉了 `BUILDLOCK_HELD` 也一样。把环境变量拷给其他进程，并不能让它们插队。
+5. **回填（backfill）。** 排在最前的重任务在等内存时，后面的重任务如果自己能通过所有检查（槽位、负载、压力、留足预留的内存），并且学到的耗时（至少 3 次运行的 p90）不超过 `BACKFILL_MAX_SECONDS`（2 分钟），就可以先跑。没有历史的命令从不回填；候选者之间仍按到达顺序，只有最早的那个能尝试。等待超过 `HEAVY_STARVE_SECONDS`（一分钟）后，等内存的任务受到保护，回填停止，除非它已经没指望：没有任务在启动爬升，而且连下面的放宽检查也放不下它，只有 buildlock 之外释放内存才帮得上忙。同一时间只有一个回填任务在跑，它跑的期间等待的任务一直受保护，所以任意两次回填之间它都能得到一次干净的检查。
+6. **内存被别处占用。** 重任务等内存满 `MEMORY_RELAX_SECONDS`（5 分钟），两条通道都没有任务在启动爬升，而且即使 buildlock 在跑的任务全部结束也留不足完整预留，说明它等的是 buildlock 管不到的内存（开发服务器、浏览器、编辑器）。这时它只需在预算之外留出 `CRITICAL_MEMORY_MB`，不再要求 `RESERVE_MEMORY_MB`。`status` 和 `explain` 会说明何时适用；设为 `0` 关闭。
+7. **机器空闲时：** 不再等启动间隔，最多可以跑 `cores / 4` 个重任务。内存检查始终生效。
+8. **内存告急时：** 可用内存低于总内存的十分之一（最多 3 GB），或内存压力（PSI full）过高时，什么都不启动，哪怕只有一个任务。
+9. **嵌套调用：** 任务内部再次调用 buildlock 会直接放行，不会死锁；即使 `env -i`、turbo 严格环境模式之类的包装丢掉了 `BUILDLOCK_HELD` 也一样。把环境变量拷给其他进程，并不能让它们插队。
+
+**卡住的任务。** 在跑的任务如果在最近 `STALL_SECONDS`（30 分钟）里整个进程树只用了不到 `STALL_CPU_SECONDS`（5 秒）的 CPU（比如卡在某个 worker 上的测试运行器），`status` 和 `doctor` 会把它标为 `stalled`。buildlock 不会停掉它：它可能在等什么、之后还会继续，所以仍占着槽位；通过守护进程干活的构建（Gradle、Bazel、Docker）看起来也是这样。
+
+**调用方没了。** 排队中的任务如果调用方退出了（shell 被杀、AI 工具的调用超时），它会以退出码 74 离开队列，而不是之后白跑一趟：它启动时的父进程号变了，无论是被 init 还是被 `systemd --user` 这类 subreaper 接管。已经在跑的任务不受影响。`BUILDLOCK_KEEP_ORPHANS=1` 会让这类任务继续排队；用 `nohup`、`setsid` 启动的，或输出单独重定向到普通文件的（`buildlock make > build.log &`）也一样，因为之后还有人能读到结果；与调用方共用的输出（比如 AI 工具调用的输出文件）不算。
 
 **命令本身。** 在终端里，命令和 buildlock 在同一个进程组，终端照常作用于它：Ctrl-C、Ctrl-Z、Ctrl-\、调整窗口大小，以及 sudo / ssh / gpg 通过 `/dev/tty` 的密码提示。循环里按 Ctrl-C 会停掉整个循环。在其他场合（AI 编码工具、CI、管道），命令有自己的会话，buildlock 把 HUP、INT、QUIT、TERM 转发给它的整个进程树，只发一次；命令可以先清理再退出，第二次信号才强制结束。命令退出后，它在该会话里留下的进程也会被停掉，之后才释放槽位。buildlock 自己被 `kill -9` 时，看门狗会在几秒内停掉留下的命令。排队时按 Ctrl-Z，后面的任务会先走。
 
@@ -176,6 +182,7 @@ buildlock 会导出 `BUILDLOCK_WORKERS`（一个重任务预计占用的核数�
 
 - **退出码：** 与命令本身一致。
 - **73：** 等待超时（`--timeout` / `BUILDLOCK_TIMEOUT`），命令没有运行。
+- **74：** 排队时调用方退出了，命令没有运行。
 - **126 / 127：** 不可执行 / 命令不存在（排队前就会检查）。
 - **129 / 130 / 131 / 143：** 排队时被 HUP / INT / QUIT / TERM 取消。
 
@@ -211,6 +218,11 @@ buildlock quiet on        # 强制进入安静模式，直到执行 buildlock qu
 | `CRITICAL_MEMORY_MB` | 内存 / 10，最多 3072 | 可用内存低于它时什么都不启动 |
 | `DEFAULT_MEMORY_MB` | 内存 / 4，最多 8192 | 没有历史的重任务的内存预算 |
 | `START_GAP` | 20 | 两次重任务启动之间的秒数 |
+| `LIGHT_SHORT_MAX_MB`、`LIGHT_SHORT_MAX_SECONDS` | 内存 / 8（最多 5120）、60 | 学到的内存不超过前者、耗时不超过后者的命令进入轻量通道 |
+| `BACKFILL_MAX_SECONDS` | 120 | 学到的耗时在此之内的重任务，可以先于等内存的重任务启动（0：不回填） |
+| `MEMORY_RELAX_SECONDS` | 300 | 等 buildlock 之外占用的内存这么久后，重任务只需在预算外留出 `CRITICAL_MEMORY_MB`（0：不放宽） |
+| `STALL_SECONDS`、`STALL_CPU_SECONDS` | 1800、5 | 在跑的任务在这段时间内用的 CPU 少于这么多秒，就显示为卡住 |
+| `KEEP_ORPHANS` | auto | `on`：调用方退出后仍运行排队中的任务；`auto`：在 `nohup`、`setsid` 下或输出单独写进文件时这样做 |
 | `LOAD_MAX` | cores × 1.25 | 与其他任务并排启动时的负载上限 |
 | `CORES` | `nproc` | 按多少核来规划（容器和 WSL 里建议设置） |
 | `BYPASS` | off | 命令直接运行，不排队 |
@@ -254,18 +266,21 @@ fi
 - **`buildlock --status`：** 每个任务一行（没有任务时是 `holder none`），最后是汇总行：
   ```text
   holder pid=1234 age=12s worktree=/path slot=0 class=heavy
+  holder pid=1236 age=36012s worktree=/path slot=1 class=heavy stalled=35400s
   queued pid=1240 age=3s worktree=/path class=heavy
-  scheduler running=1/4 next=start light=0/8 idle=yes expected_load=9.00 max=8 light_max=16
+  scheduler running=2/4 next=start light=0/8 idle=yes expected_load=9.00 max=8 light_max=16 relaxed=no backfill=no
   ```
-- **`buildlock status --json`、`buildlock stats --json`：** 通道、在跑和排队的任务、机器指标；每条命令的统计。
-- **`buildlock --explain <cmd>`：** key、样本数、画像、通道和预算、结论。
+  `stalled=` 只出现在卡住的任务上。`relaxed=yes` 表示重任务的结论来自放宽的内存检查，`backfill=yes` 表示短的重任务可以绕过等内存的任务先跑；结论按那个任务自己的预算计算。
+- **`buildlock status --json`、`buildlock stats --json`：** 通道（重任务通道带 `memoryRelaxed` 和 `backfill`）、在跑的任务（带 `stalledSeconds`，没卡住时为 `null`）、排队的任务、机器指标；每条命令的统计、等待原因和 `admissions`（按放行方式统计的启动次数）。
+- **`buildlock --explain <cmd>`：** key、样本数、画像、通道和预算、结论，然后是 `backfill:`（能否回填，不能时说明原因）和 `relaxed:`（等满 `MEMORY_RELAX_SECONDS` 后放宽的内存检查会怎么判）。
 - **stderr 上的 `buildlock: waited Ns`：** 需要等待的任务开始时打印。不用等待的任务什么都不打印，解析时把缺失当作 0。
-- **任务日志：** `~/.cache/buildlock/jobs-YYYY-MM.jsonl`，JSON Lines，每个结束的任务一行：`at`、`end`、`pid`、`cwd`、`class`、`budgetMb`、`waitSeconds`、`runSeconds`、`exit`、`cmd`、`key`、`peakMb`、`budgetSource`、`admission`，等过的任务还有 `waitReasons`（按阻塞原因统计的等待秒数：`slot`、`memory`、`memory-pressure`、`gap`、`load`、`cpu`、`io`、`swap`、`order`）。`buildlock history --json` 会原样输出；`buildlock stats` 汇总各原因。
+- **任务日志：** `~/.cache/buildlock/jobs-YYYY-MM.jsonl`，JSON Lines，每个结束的任务一行：`at`、`end`、`pid`、`cwd`、`class`、`budgetMb`、`waitSeconds`、`runSeconds`、`exit`、`cmd`、`key`、`peakMb`、`budgetSource`、`admission`（`free`；空闲快速通道为 `idle`；`backfill`；`memory-relaxed`），等过的任务还有 `waitReasons`（按阻塞原因统计的等待秒数：`slot`、`memory`、`memory-pressure`、`gap`、`load`、`cpu`、`io`、`swap`、`order`）。`buildlock history --json` 会原样输出；`buildlock stats` 汇总各原因。
 - **环境变量：** `BUILDLOCK_CLASS=light|heavy`、`BUILDLOCK_JOB_MEMORY_MB`、`BUILDLOCK_TIMEOUT`、`BUILDLOCK_BYPASS`。隔离测试用：`BUILDLOCK_LOCK_PATH`、`BUILDLOCK_JOB_LOG_DIR`、`BUILDLOCK_CONFIG=`（不读配置）。
 
 ## 常见问题
 
 - **任务一直在等：** `buildlock status` 会用白话说明两条通道各在等什么；`buildlock doctor` 显示当前生效的上限。
+- **某个任务占着槽位好几个小时：** 进程不再用 CPU 时，`buildlock status` 和 `buildlock doctor` 会把它标为 `stalled`；确认后用 `kill <pid>` 停掉（buildlock 会把信号转给整个命令）。
 - **在 shell 里能用的命令报「command not found」：** 那是别名或函数，见 [Shell、容器和 WSL](#shell容器和-wsl)。
 - **设置不生效：** `buildlock config list` 会显示每个值及其来源（default、config、quiet、env）；配置文件出错时 `buildlock doctor` 会指出来。
 - **AI 工具没有用它：** 先看 `buildlock agents status`，再重启该工具的会话，它们只在会话开始时读取说明文件。

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.0
+
+**Memory waits**
+
+- Backfill: while the first heavy job waits for memory, a later heavy job may start ahead of it when it passes every admission check on its own and has a learned run time (p90 of at least 3 runs) within `BACKFILL_MAX_SECONDS` (default 120; 0 turns it off). Commands without that history never backfill; candidates keep arrival order (only the oldest may try). The waiting job is protected from `HEAVY_STARVE_SECONDS` on, which stops backfill, unless it is hopeless (nothing is starting up and even the relaxed check below would not fit it). Only one backfilled job runs at a time: while it runs the waiting job stays protected, so backfills cannot chain into a stream that keeps it waiting. Such starts are logged with `"admission":"backfill"`.
+- Relaxed memory check: a heavy job that has waited `MEMORY_RELAX_SECONDS` (default 300) for memory, while no job of either lane is starting up, needs only `CRITICAL_MEMORY_MB` free after its budget instead of `RESERVE_MEMORY_MB`, but only when the running jobs' ends would not free enough for the full reserve either: the shortfall is memory held outside buildlock, which waiting does not free. While buildlock's own jobs hold enough, it keeps waiting for them. `0` turns the check off. Logged as `"admission":"memory-relaxed"`.
+- The light-lane reservation for a waiting heavy job follows the same protection: light jobs are no longer held back for a heavy job that cannot start anyway, except while another job is starting up.
+- `status` judges the heavy lane for the job actually waiting on memory, with its own budget (before, a job with the default budget), says when the relaxed check applies or will, and says when backfill is open. `--status` adds `relaxed=` and `backfill=` at the end of the scheduler line; `status --json` adds `memoryRelaxed` and `backfill` to the heavy lane. `explain` adds `backfill:` and `relaxed:` lines after `verdict:`. `stats` counts starts by admission (`admissions` in `--json`).
+
+**Light lane**
+
+- Short commands take the light lane with a larger memory cap: a learned budget up to `LIGHT_SHORT_MAX_MB` (default RAM / 8, at most 5120) and a learned p90 run up to `LIGHT_SHORT_MAX_SECONDS` (default 60). Test files, lint and partial type-checks that take seconds but 2–5 GB no longer queue behind long builds. Above `LIGHT_MAX_MB` such a job keeps the start gap and counts as `WORKERS` CPUs, so a burst of them cannot outrun the load average. The heavy job's memory reservation applies to them as to every light job.
+
+**Running and queued jobs**
+
+- A running job whose processes used under `STALL_CPU_SECONDS` (default 5) of CPU in `STALL_SECONDS` (default 1800) shows as stalled: `stalled=Ns` at the end of its `--status` line, `stalledSeconds` in `status --json`, a note in `status` and a warning in `doctor`, which mention that builds working through a daemon (Gradle, Bazel, Docker) look the same. Nothing is stopped, and it keeps its slot.
+- A queued job whose caller exits (its parent pid changes, whether to init or to a subreaper such as `systemd --user`) leaves the queue with exit code 74 and says so on stderr, instead of running later for nobody. Running jobs are never affected. `KEEP_ORPHANS=on` (`BUILDLOCK_KEEP_ORPHANS=1`) keeps such jobs; the default `auto` keeps them when the caller set them up to outlive it: SIGHUP ignored (`nohup`), their own session (`setsid`), or stdout or stderr redirected to a regular file of its own (`buildlock cmd > log &`). Output it shares with the caller (a pipe, a terminal, an agent tool's output file) has nobody left to read it.
+- Queue files gain a trailing field (`backfill` or `-`), which older versions ignore.
+
 ## 0.2.3
 
 - The job log says why a job waited: `waitReasons` holds the seconds spent on each blocking reason (`slot`, `memory`, `memory-pressure`, `gap`, `load`, `cpu`, `io`, `swap`, `order` for a job queued behind an earlier one, `other`), taken from the verdict `--status` shows. It appears only on a line with a wait; older lines and readers are unaffected. `buildlock stats` (and `stats --json`, as a trailing `waitReasons` member) totals them.

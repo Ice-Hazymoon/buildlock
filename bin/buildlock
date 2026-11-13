@@ -43,6 +43,34 @@
 # lane's cap to its slot count. Memory checks always apply. A job that needed
 # this path is logged with "admission":"idle", else "free".
 #
+# Short commands get a larger light cap: a learned budget up to
+# BUILDLOCK_LIGHT_SHORT_MAX_MB (default RAM / 8, at most 5120) with a learned
+# p90 run up to BUILDLOCK_LIGHT_SHORT_MAX_SECONDS (default 60) joins the light
+# lane too (on its own, or when `BUILDLOCK_CLASS=light` asks for it). Above
+# LIGHT_MAX_MB such a job keeps the start gap and counts as WORKERS CPUs.
+#
+# Memory waits. A heavy head refused on memory publishes itself in
+# `<lock>.heavywait` ("pid<TAB>since<TAB>budget_mb"). From
+# BUILDLOCK_HEAVY_STARVE_SECONDS (60) on it is protected: light jobs keep its
+# budget free too and nothing backfills past it (head_protected), unless it is
+# hopeless (nothing ramping up, and even the critical floor would not fit it).
+# Until then, or while hopeless, the oldest later heavy waiter with a learned
+# p90 run <= BUILDLOCK_BACKFILL_MAX_SECONDS (120; marked in its queue file; one at a time) may
+# start past it when it passes every check on its own ("admission":"backfill").
+# After BUILDLOCK_MEMORY_RELAX_SECONDS (300; 0 = never) on memory with no job
+# of either lane ramping up, and when the running jobs' ends would not free
+# enough for the full reserve either (the memory is held outside buildlock),
+# the head needs only BUILDLOCK_CRITICAL_MEMORY_MB free after its budget
+# instead of the reserve ("admission":"memory-relaxed").
+#
+# A queued waiter whose caller exits (its parent pid changes: reparented to
+# init or a subreaper) leaves the queue with exit 74 unless
+# BUILDLOCK_KEEP_ORPHANS is on (auto: on under nohup or setsid, or when its
+# stdout or stderr is a regular file the caller does not write to as well). A running job's sampler also records when its tree last used
+# BUILDLOCK_STALL_CPU_SECONDS of CPU (`<lock>.active.<pid>`); status and doctor
+# show it as stalled after BUILDLOCK_STALL_SECONDS without that, and it keeps
+# its slot.
+#
 # `BUILDLOCK_CLASS=light` (small, quick jobs, budget <= BUILDLOCK_LIGHT_MAX_MB)
 # gets its own slot pool (BUILDLOCK_LIGHT_SLOTS) and skips the heavy FIFO head
 # and start gap, but still waits out the same load/pressure/memory ceilings and
@@ -178,9 +206,10 @@ unset _name _knob _now
 # f = decimal number.
 for _spec in WORKERS:n CORES:n SLOTS:n MAX_JOBS:n LIGHT_SLOTS:n LIGHT_MAX_JOBS:n LIGHT_CPUS:z START_GAP:z \
     RAMP_SECONDS:z RAMP_CPU_SECONDS:z HEAVY_STARVE_SECONDS:z RESERVE_MEMORY_MB:z CRITICAL_MEMORY_MB:z DEFAULT_MEMORY_MB:n \
-    DEFAULT_LIGHT_MEMORY_MB:n LIGHT_MAX_MB:z LIGHT_MAX_SECONDS:z JOB_MEMORY_MB:n LOAD_MAX:f CPU_PRESSURE_MAX:f \
-    IO_PRESSURE_MAX:f MEMORY_PRESSURE_MAX:f CRITICAL_MEMORY_PRESSURE:f IDLE_LOAD_RATIO:f IDLE_CPU_PRESSURE:f \
-    IDLE_IO_PRESSURE:f SAMPLE_SECONDS:f; do
+    DEFAULT_LIGHT_MEMORY_MB:n LIGHT_MAX_MB:z LIGHT_MAX_SECONDS:z LIGHT_SHORT_MAX_MB:z LIGHT_SHORT_MAX_SECONDS:z \
+    BACKFILL_MAX_SECONDS:z MEMORY_RELAX_SECONDS:z STALL_SECONDS:n STALL_CPU_SECONDS:n JOB_MEMORY_MB:n LOAD_MAX:f \
+    CPU_PRESSURE_MAX:f IO_PRESSURE_MAX:f MEMORY_PRESSURE_MAX:f CRITICAL_MEMORY_PRESSURE:f IDLE_LOAD_RATIO:f \
+    IDLE_CPU_PRESSURE:f IDLE_IO_PRESSURE:f SAMPLE_SECONDS:f; do
     _name="BUILDLOCK_${_spec%:*}"
     [[ -n "${!_name+set}" ]] || continue
     case "${_spec#*:}" in
@@ -229,6 +258,7 @@ def_workers=$(( cores < 8 ? cores : 8 ))
 def_heavy_mb="$(ram_share 8192 1024 4)"
 def_reserve_mb="$(ram_share 6144 512 8)"
 def_critical_mb="$(ram_share 3072 256 10)"
+def_light_short_mb="$(ram_share 5120 2048 8)"
 
 : "${BUILDLOCK_WORKERS:=$def_workers}"
 
@@ -288,6 +318,11 @@ light_slots="${BUILDLOCK_LIGHT_SLOTS:-$(( cores / 4 > 1 ? cores / 4 : 1 ))}"
 light_max_mb="${BUILDLOCK_LIGHT_MAX_MB:-2048}"
 light_max_seconds="${BUILDLOCK_LIGHT_MAX_SECONDS:-180}"
 light_cpus="${BUILDLOCK_LIGHT_CPUS:-2}"
+# A command that usually ends within LIGHT_SHORT_MAX_SECONDS may take the light
+# lane with up to LIGHT_SHORT_MAX_MB: it holds that memory and a light slot only
+# briefly, while in the heavy lane it would queue behind long builds.
+light_short_max_mb="${BUILDLOCK_LIGHT_SHORT_MAX_MB:-$def_light_short_mb}"
+light_short_max_seconds="${BUILDLOCK_LIGHT_SHORT_MAX_SECONDS:-60}"
 default_heavy_mb="${BUILDLOCK_DEFAULT_MEMORY_MB:-$def_heavy_mb}"
 default_light_mb="${BUILDLOCK_DEFAULT_LIGHT_MEMORY_MB:-1536}"
 profile_mode="${BUILDLOCK_PROFILE:-on}"
@@ -295,6 +330,19 @@ profile_mode="${BUILDLOCK_PROFILE:-on}"
 # After this long waiting on memory, a heavy head has light jobs keep its
 # budget free too, so a stream of small jobs cannot starve it.
 heavy_starve_seconds="${BUILDLOCK_HEAVY_STARVE_SECONDS:-60}"
+# While a heavy head waits on memory, a later heavy job whose learned p90 run
+# time is at most this many seconds may start around it (0: never).
+backfill_max_seconds="${BUILDLOCK_BACKFILL_MAX_SECONDS:-120}"
+# After this long waiting on memory, with no job left ramping up, a heavy head
+# needs only the critical floor free after its budget, not the full reserve.
+memory_relax_seconds="${BUILDLOCK_MEMORY_RELAX_SECONDS:-300}"
+# A running job whose process tree used under STALL_CPU_SECONDS of CPU in the
+# last STALL_SECONDS is shown as stalled (never stopped: it keeps its slot).
+stall_seconds="${BUILDLOCK_STALL_SECONDS:-1800}"
+stall_cpu_seconds="${BUILDLOCK_STALL_CPU_SECONDS:-5}"
+# A queued job whose caller exited leaves the queue (exit 74) unless this is on;
+# auto keeps it when SIGHUP is ignored (nohup), which asks it to outlive the caller.
+keep_orphans="${BUILDLOCK_KEEP_ORPHANS:-auto}"
 
 # Idle fast path knobs.
 sample_seconds="${BUILDLOCK_SAMPLE_SECONDS:-2}"
@@ -380,6 +428,7 @@ proc_info() {
     # After "pid (comm) ": state, ppid, ... and starttime (field 22) at index 19.
     proc_state="${fields[0]:-}"
     proc_ppid="${fields[1]:-0}"
+    proc_session="${fields[3]:-0}"
     [[ -n "$boot_time" ]] || read_boot_time
     proc_start=$(( boot_time + ${fields[19]:-0} / 100 ))
 }
@@ -519,6 +568,52 @@ tree_rss_kb() {
         }'
 }
 
+# "rss_kb cpu_seconds" of the process tree under pid $1: its resident KiB, as
+# tree_rss_kb, and the CPU time (user + system, reaped children's included) of
+# its members outside the subtree of pid $2 (the sampler: its own polling is
+# not the job's work). $3 = clock ticks per second.
+tree_usage() {
+    ps -e -o pid=,ppid=,rss= | awk -v root="$1" -v skip="$2" -v hz="${3:-100}" '
+        { parent[$1] = $2; rss[$1] = $3 }
+        END {
+            for (pid in parent) {
+                depth = 0; mine = 0; skipped = 0
+                for (p = pid; p != "" && p > 1 && depth < 256; p = parent[p]) {
+                    if (p == skip) skipped = 1
+                    if (p == root) { mine = 1; break }
+                    depth++
+                }
+                if (!mine) continue
+                total += rss[pid]
+                if (skipped) continue
+                # Fields after "pid (comm) ": utime, stime, cutime, cstime are 12 to 15.
+                file = "/proc/" pid "/stat"
+                if ((getline line < file) > 0) {
+                    sub(/^.*\) /, "", line); split(line, f, " ")
+                    ticks += f[12] + f[13] + f[14] + f[15]
+                }
+                close(file)
+            }
+            printf "%d %d\n", total, ticks / hz
+        }'
+}
+
+# The file a running job's sampler keeps "since<TAB>cpu_seconds" in: since is
+# the last time its tree had used STALL_CPU_SECONDS of CPU since the time
+# before (the job start at first).
+activity_file() { printf '%s.active.%s' "$lock_path" "$1"; }
+
+# Prints how many seconds the running job $1 (started at epoch $2) has been stalled (its tree used
+# under STALL_CPU_SECONDS of CPU for at least STALL_SECONDS), or nothing.
+stalled_for() {
+    local since=''
+    IFS=$'\t' read -r since _ 2>/dev/null < "$(activity_file "$1")" || return 0
+    [[ "$since" =~ ^[0-9]+$ ]] || return 0
+    # A file older than this holder's start was left by an earlier job with the pid.
+    [[ ! "${2:-}" =~ ^[0-9]+$ ]] || (( since >= $2 )) || return 0
+    (( EPOCHSECONDS - since < stall_seconds )) || printf '%s' $(( EPOCHSECONDS - since ))
+}
+
 exceeds() { awk -v value="$1" -v max="$2" 'BEGIN { exit !(value + 0 > max + 0) }'; }
 
 # Looks up up to the last 20 finished job-log lines (current + previous month)
@@ -609,12 +704,15 @@ holder_class_for_pid() {
 # live light waiter (its own arrival-order queue, independent of the heavy
 # head), legacy_waiting to 1 when a waiter of the previous script (which only
 # takes slot 0, always heavy) is queued, and queue_ahead to the waiters of this
-# job's lane that arrived before it (only once my_queue_key is set).
+# job's lane that arrived before it (only once my_queue_key is set), and
+# backfill_pid to the oldest heavy waiter behind the head whose queue file marks
+# it able to backfill (backfill_eligible).
 # Builtins only: every waiter runs this about once a second.
 scan_queue() {
-    local file pid fields key lane best_key='' light_best_key=''
+    local file pid fields key lane best_key='' light_best_key='' fill_keys=() fill_pids=() i fill_key=''
     head_pid=''
     light_head_pid=''
+    backfill_pid=''
     legacy_waiting=0
     queue_ahead=0
     for file in "$queue_dir"/*; do
@@ -650,9 +748,18 @@ scan_queue() {
             fi
             continue
         fi
+        if [[ "${fields[6]:-}" == backfill ]]; then fill_keys+=("$key"); fill_pids+=("$pid"); fi
         if [[ -z "$best_key" ]] || (( key < best_key || (key == best_key && pid < head_pid) )); then
             best_key="$key"
             head_pid="$pid"
+        fi
+    done
+    # Candidates keep arrival order among themselves: only the oldest may try.
+    for i in "${!fill_pids[@]}"; do
+        [[ "${fill_pids[i]}" != "$head_pid" ]] || continue
+        if [[ -z "$fill_key" ]] || (( fill_keys[i] < fill_key || (fill_keys[i] == fill_key && fill_pids[i] < backfill_pid) )); then
+            fill_key="${fill_keys[i]}"
+            backfill_pid="${fill_pids[i]}"
         fi
     done
 }
@@ -661,7 +768,8 @@ scan_queue() {
 queue_alive() {
     local pid="$1" since=''
     shift 2
-    # Current files: pid, queued_at, cwd, "scheduled", key, class. The previous
+    # Current files: pid, queued_at, cwd, "scheduled", key, class, then
+    # "backfill" or "-" (a trailing field older readers ignore). The previous
     # script's lack the marker, so they are checked by name.
     [[ "${4:-}" != scheduled ]] || since="${2:-}"
     job_alive "$pid" "$since"
@@ -700,7 +808,8 @@ idle_check() {
         [[ -n "$pid" ]] || continue
         [[ "$started" =~ ^[0-9]+$ ]] || continue
         if (( EPOCHSECONDS - started < ramp_cpu_seconds )); then
-            if [[ "$class" == light ]]; then
+            # A short-light job above LIGHT_MAX_MB is a full build that ends soon.
+            if [[ "$class" == light ]] && ! { [[ "$memory" =~ ^[0-9]+$ ]] && (( memory > light_max_mb )); }; then
                 extra=$(( extra + light_cpus ))
             else
                 extra=$(( extra + BUILDLOCK_WORKERS ))
@@ -826,15 +935,33 @@ queue_entries() {
     done | sort -n
 }
 
+# For status: sets reason to the heavy lane's next verdict, judged for the head
+# waiting on memory with its own budget and wait (else for a job with this
+# call's budget), with hv_relaxed set as heavy_verdict does, and backfill_now=1
+# while short jobs may start past that head. Needs heavy_count, light_count,
+# jobs and idle in the caller.
+heavy_lane_state() {
+    backfill_now=0
+    if read_heavy_wait; then
+        heavy_verdict "$hw_budget" "$hw_since"
+        if [[ "$hv_reason" == 'memory: '* ]] && ! head_protected "$hw_budget" "$hw_since" "$jobs"; then backfill_now=1; fi
+    else
+        heavy_verdict "$job_memory_mb" ''
+    fi
+    reason="$hv_reason"
+}
+
 # `--status`: the stable, line-oriented format scripts and tests parse.
 status() {
-    local holders slot pid started cwd class summary heavy_count light_count jobs reason idle_text key queued_at
+    local holders slot pid started cwd class summary heavy_count light_count jobs reason idle_text key queued_at stalled
     holders="$(live_holders)"
     if [[ -z "$holders" ]]; then
         printf 'holder none\n'
     else
         while IFS=$'\t' read -r slot pid started cwd _memory class; do
-            printf 'holder pid=%s age=%ss worktree=%s slot=%s class=%s\n' "$pid" "$(( EPOCHSECONDS - started ))" "$cwd" "$slot" "${class:-heavy}"
+            stalled="$(stalled_for "$pid" "${started:-}")"
+            printf 'holder pid=%s age=%ss worktree=%s slot=%s class=%s%s\n' "$pid" "$(( EPOCHSECONDS - started ))" "$cwd" "$slot" "${class:-heavy}" \
+                "${stalled:+ stalled=${stalled}s}"
         done <<< "$holders"
     fi
     while IFS=$'\t' read -r key pid queued_at cwd class; do
@@ -844,11 +971,27 @@ status() {
     summary="$(running_summary)"
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$holders"
-    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    heavy_lane_state
     idle_text=no
     [[ "$idle" != 1 ]] || idle_text=yes
-    printf 'scheduler running=%s/%s next=%s light=%s/%s idle=%s expected_load=%s max=%s light_max=%s\n' \
-        "$heavy_count" "$slots" "${reason:-start}" "$light_count" "$light_slots" "$idle_text" "$expected_load" "$max_jobs" "$light_max_jobs"
+    printf 'scheduler running=%s/%s next=%s light=%s/%s idle=%s expected_load=%s max=%s light_max=%s relaxed=%s backfill=%s\n' \
+        "$heavy_count" "$slots" "${reason:-start}" "$light_count" "$light_slots" "$idle_text" "$expected_load" "$max_jobs" "$light_max_jobs" \
+        "$( (( hv_relaxed == 1 )) && printf yes || printf no)" "$( (( backfill_now == 1 )) && printf yes || printf no)"
+}
+
+# Succeeds when a learned budget $1 (empty: none) fits the light lane's cap for
+# short commands: learned p90 run within LIGHT_SHORT_MAX_SECONDS.
+short_light() {
+    [[ -n "$1" && -n "$est_run" ]] && (( $1 <= light_short_max_mb && est_run <= light_short_max_seconds ))
+}
+
+# Succeeds when a heavy job may backfill past a head that waits on memory: a
+# learned profile (so its run time is known, not hoped) that usually ends
+# within BACKFILL_MAX_SECONDS. While one backfilled job runs the head stays
+# protected (head_protected), so backfills never overlap into a chain that
+# keeps the head waiting. Unknown commands never backfill.
+backfill_eligible() {
+    [[ "$job_class" == heavy && -n "$est_run" ]] && (( profile_count >= 3 && backfill_max_seconds > 0 && est_run <= backfill_max_seconds ))
 }
 
 # Sets job_key, profile_count, est_mb, est_run, job_class, job_memory_mb and
@@ -892,13 +1035,14 @@ resolve_job() {
                 job_memory_mb="$default_light_mb"; budget_source=default
             fi
             job_class=heavy
-            (( job_memory_mb > light_max_mb )) || job_class=light
+            if (( job_memory_mb <= light_max_mb )) || short_light "$learned_mb"; then job_class=light; fi
             ;;
         *)
             if [[ -n "$learned_mb" ]]; then
                 job_memory_mb="$learned_mb"; budget_source=learned
                 job_class=heavy
-                if (( learned_mb <= light_max_mb )) && [[ -n "$est_run" ]] && (( est_run <= light_max_seconds )); then
+                if { (( learned_mb <= light_max_mb )) && [[ -n "$est_run" ]] && (( est_run <= light_max_seconds )); } \
+                    || short_light "$learned_mb"; then
                     job_class=light
                 fi
             elif [[ -n "${BUILDLOCK_JOB_MEMORY_MB:-}" ]]; then
@@ -914,7 +1058,7 @@ resolve_job() {
 
 # `--explain`: the stable format; the human view is the same lines.
 cmd_explain() {
-    local summary heavy_count light_count jobs verdict
+    local summary heavy_count light_count jobs verdict fill relaxed
     summary="$(running_summary)"
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$(live_holders)"
@@ -932,6 +1076,35 @@ cmd_explain() {
     fi
     printf 'class: %s budget=%sMB source=%s\n' "$job_class" "$job_memory_mb" "$budget_source"
     printf 'verdict: %s\n' "${verdict:-start}"
+    # Lines added after the original ones, so parsers of those keep working:
+    # whether it may backfill, and what the relaxed memory check (heavy_verdict)
+    # would say once it had waited long enough on memory.
+    if backfill_eligible; then fill="yes (learned p90 run ${est_run}s <= ${backfill_max_seconds}s)"
+    elif [[ "$job_class" == light ]]; then fill='no (light lane)'
+    elif (( profile_count < 3 )) || [[ -z "$est_run" ]]; then fill='no (fewer than 3 runs)'
+    elif (( backfill_max_seconds == 0 )); then fill='no (BACKFILL_MAX_SECONDS=0)'
+    else fill="no (learned p90 run ${est_run}s > ${backfill_max_seconds}s)"; fi
+    printf 'backfill: %s\n' "$fill"
+    relaxed='not needed'
+    if [[ "$job_class" == light ]]; then
+        relaxed='not needed (light lane)'
+    elif [[ "$verdict" == 'memory: '* ]] && (( memory_relax_seconds == 0 )); then
+        relaxed='off (MEMORY_RELAX_SECONDS=0)'
+    elif [[ "$verdict" == 'memory: '* ]]; then
+        ramping_count "$jobs"
+        jobs_held_mb "$jobs"
+        read_avail
+        if (( avail_now > 0 && avail_now + held_mb - job_memory_mb >= reserve_memory_mb )); then
+            relaxed="still waits: the running jobs hold $(fmt_mb "$held_mb"), enough for the full reserve once they end"
+        elif (( ramping_n > 0 )); then
+            relaxed="still waits after ${memory_relax_seconds}s on memory ($ramping_n job(s) still ramping up)"
+        else
+            relaxed="$(reserve_memory_mb="$critical_memory_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+            if [[ -z "$relaxed" ]]; then relaxed="start after ${memory_relax_seconds}s on memory"
+            else relaxed="still waits after ${memory_relax_seconds}s on memory ($relaxed)"; fi
+        fi
+    fi
+    printf 'relaxed: %s\n' "$relaxed"
     [[ "${1:-}" == human ]] || return 0
     # The lines above are a stable format; `explain` adds a sentence for people.
     printf '\n'
@@ -942,6 +1115,13 @@ cmd_explain() {
         explicit) printf '(set with --memory or BUILDLOCK_JOB_MEMORY_MB).\n' ;;
         *) printf '(a default: buildlock learns it from the 3rd run; %s so far).\n' "$profile_count" ;;
     esac
+    if backfill_eligible; then
+        printf 'It usually finishes within %s, so it may start ahead of a heavy job that waits for memory.\n' "$(fmt_dur "$est_run")"
+    fi
+    if [[ "$relaxed" == 'start after'* ]]; then
+        printf 'After %s waiting on memory with no job starting up, it would need only %s free after it, and would start then.\n' \
+            "$(fmt_dur "$memory_relax_seconds")" "$(fmt_mb "$critical_memory_mb")"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1149,9 +1329,12 @@ human_reason() {
     if [[ "$r" =~ $re ]]; then
         printf 'not enough free memory: %s free, %s for this job' "$(fmt_mb "${BASH_REMATCH[1]}")" "$(fmt_mb "${BASH_REMATCH[3]}")"
         (( BASH_REMATCH[2] == 0 )) || printf ', %s more for jobs still starting' "$(fmt_mb "${BASH_REMATCH[2]}")"
-        local kept="${BASH_REMATCH[4]}" held=0
+        local kept="${BASH_REMATCH[4]}" held=0 running_jobs
         printf ' and %s kept in reserve' "$(fmt_mb "$kept")"
-        [[ "$lane" != light ]] || held="$(heavy_wait_reserve)"
+        if [[ "$lane" == light ]]; then
+            read -r _ _ running_jobs <<< "$(running_summary)"
+            held="$(heavy_wait_reserve "$running_jobs")"
+        fi
         if [[ "$held" =~ ^[0-9]+$ ]] && (( held > 0 && held < kept )); then
             printf ' (%s of it for a heavy job that has waited longer)' "$(fmt_mb "$held")"
         fi
@@ -1166,12 +1349,12 @@ human_reason() {
 status_human() {
     local holders summary heavy_count light_count jobs reason light_reason metrics width cmd_w where_w
     local load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full ram quiet
-    local slot pid started cwd memory class key queued_at n=0 cmd label
+    local slot pid started cwd memory class key queued_at n=0 cmd label stalled
     holders="$(live_holders)"
     summary="$(running_summary)"
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$holders"
-    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    heavy_lane_state
     light_reason="$(job_memory_mb="$default_light_mb"; light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
     metrics="$(proc_metrics)"
     read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
@@ -1198,6 +1381,9 @@ status_human() {
             slot="${slot/light/l}"
             printf '  %-5s %-8s %-7s %-8s %-*s %s\n' "$slot" "$pid" "$(fmt_dur "$(( EPOCHSECONDS - ${started:-$EPOCHSECONDS} ))")" \
                 "$(fmt_mb "$memory")" "$where_w" "$(short_path "$cwd" "$where_w")" "$(clip "$cmd" "$cmd_w")"
+            stalled="$(stalled_for "$pid" "${started:-}")"
+            [[ -z "$stalled" ]] || printf '        %sstalled %s%s: its processes used under %ss of CPU in that time (a build that works through a daemon looks like this too); it keeps its slot\n' \
+                "$c_yellow" "$(fmt_dur "$stalled")" "$c_reset" "$stall_cpu_seconds"
         done <<< "$holders"
     else
         note "nothing running"
@@ -1224,8 +1410,34 @@ status_human() {
     if [[ "$idle" == 1 ]]; then printf ' %s %sidle%s' "$s_dot" "$c_green" "$c_reset"; fi
     printf '\n'
     if [[ -r "$proc_root/pressure/cpu" ]]; then printf '         pressure: cpu %s%% %s io %s%% %s memory %s%%\n' "$cpu" "$s_dot" "$io" "$s_dot" "$mem_some"; fi
-    printf '%sNext%s     heavy: %s\n' "$c_bold" "$c_reset" "$(verdict_text "$reason" heavy)"
+    if (( hv_relaxed == 1 )); then
+        printf '%sNext%s     heavy: %sstarts now%s, memory relaxed: it has waited %s on memory that no starting job will free, so %s stays free after it instead of %s\n' \
+            "$c_bold" "$c_reset" "$c_green" "$c_reset" "$(fmt_dur "$(( EPOCHSECONDS - hw_since ))")" "$(fmt_mb "$critical_memory_mb")" "$(fmt_mb "$reserve_memory_mb")"
+    else
+        printf '%sNext%s     heavy: %s%s\n' "$c_bold" "$c_reset" "$(verdict_text "$reason" heavy)" "$(relax_note)"
+    fi
+    (( backfill_now == 0 )) || printf '         backfill: a heavy job learned to finish within %s may start ahead of it\n' "$(fmt_dur "$backfill_max_seconds")"
     printf '         light: %s\n' "$(verdict_text "$light_reason" light)"
+}
+
+# After a heavy head's memory verdict in status: when the relaxed check
+# (heavy_verdict) will apply. Uses hw_* and jobs from the caller.
+relax_note() {
+    local left
+    [[ "$reason" == 'memory: '* && -n "${hw_since:-}" ]] && (( memory_relax_seconds > 0 )) || return 0
+    left=$(( hw_since + memory_relax_seconds - EPOCHSECONDS ))
+    ramping_count "$jobs"
+    jobs_held_mb "$jobs"
+    read_avail
+    if (( avail_now > 0 && avail_now + held_mb - hw_budget >= reserve_memory_mb )); then
+        printf '; the running jobs hold %s, so it waits for them to end' "$(fmt_mb "$held_mb")"
+    elif (( avail_now > 0 && avail_now - hw_budget < critical_memory_mb )); then
+        printf '; it would not fit even with only %s kept free after it' "$(fmt_mb "$critical_memory_mb")"
+    elif (( left > 0 )); then
+        printf '; in %s, with no job starting up, it needs only %s free after it' "$(fmt_dur "$left")" "$(fmt_mb "$critical_memory_mb")"
+    else
+        printf '; once %s job(s) starting up settle, it needs only %s free after it' "$ramping_n" "$(fmt_mb "$critical_memory_mb")"
+    fi
 }
 
 verdict_text() {
@@ -1235,27 +1447,30 @@ verdict_text() {
 status_json() {
     local holders summary heavy_count light_count jobs reason light_reason metrics sep=''
     local load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full
-    local slot pid started cwd memory class key queued_at quiet_json=false
+    local slot pid started cwd memory class key queued_at quiet_json=false stalled
     holders="$(live_holders)"
     summary="$(running_summary)"
     read -r heavy_count light_count jobs <<< "$summary"
     idle_check "$holders"
-    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    heavy_lane_state
     light_reason="$(job_memory_mb="$default_light_mb"; light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
     metrics="$(proc_metrics)"
     read -r load1 avail_mb swap_total_mb swap_free_mb cpu io mem_some mem_full <<< "$metrics"
     (( quiet_active == 0 )) || quiet_json=true
     printf '{"version":"%s","cores":%s,"quiet":%s,"idle":%s,"expectedLoad":%s,' "$bl_version" "$cores" "$quiet_json" \
         "$([[ "$idle" == 1 ]] && printf true || printf false)" "${expected_load:-0}"
-    printf '"lanes":{"heavy":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s"},"light":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s"}},' \
-        "$heavy_count" "$slots" "$max_jobs" "$(json_escape "${reason:-start}")" "$light_count" "$light_slots" "$light_max_jobs" "$(json_escape "${light_reason:-start}")"
+    printf '"lanes":{"heavy":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s","memoryRelaxed":%s,"backfill":%s},"light":{"running":%s,"slots":%s,"idleMax":%s,"next":"%s"}},' \
+        "$heavy_count" "$slots" "$max_jobs" "$(json_escape "${reason:-start}")" \
+        "$( (( hv_relaxed == 1 )) && printf true || printf false)" "$( (( backfill_now == 1 )) && printf true || printf false)" \
+        "$light_count" "$light_slots" "$light_max_jobs" "$(json_escape "${light_reason:-start}")"
     printf '"running":['
     while IFS=$'\t' read -r slot pid started cwd memory class; do
         [[ -n "$pid" ]] || continue
         [[ "$started" =~ ^[0-9]+$ ]] || started="$EPOCHSECONDS"
-        printf '%s{"slot":"%s","class":"%s","pid":%s,"startedAt":%s,"ageSeconds":%s,"cwd":"%s","budgetMb":%s,"command":"%s"}' "$sep" \
+        stalled="$(stalled_for "$pid" "${started:-}")"
+        printf '%s{"slot":"%s","class":"%s","pid":%s,"startedAt":%s,"ageSeconds":%s,"cwd":"%s","budgetMb":%s,"command":"%s","stalledSeconds":%s}' "$sep" \
             "$slot" "$class" "$pid" "$started" "$(( EPOCHSECONDS - started ))" "$(json_escape "$cwd")" \
-            "$([[ "$memory" =~ ^[0-9]+$ ]] && printf '%s' "$memory" || printf null)" "$(json_escape "$(pid_command "$pid")")"
+            "$([[ "$memory" =~ ^[0-9]+$ ]] && printf '%s' "$memory" || printf null)" "$(json_escape "$(pid_command "$pid")")" "${stalled:-null}"
         sep=','
     done <<< "$holders"
     printf '],"queued":['
@@ -1451,7 +1666,7 @@ cmd_history() {
 
 cmd_stats() {
     local days=30 here=0 limit=15 json=0 needle='' files=() cutoff out rows=() width cmd_w sep=
-    local total_run n fails p50 p90 peak est lane avg_wait key repo cmd summary reason_rows=()
+    local total_run n fails p50 p90 peak est lane avg_wait key repo cmd summary reason_rows=() admission_rows=()
     while (( $# > 0 )); do
         case "$1" in
             --days) need_value "$@"; days="$2"; shift ;;
@@ -1475,7 +1690,8 @@ cmd_stats() {
     fi
     cutoff="$(date -u -d "-$days days" +%Y-%m-%dT%H:%M:%SZ)"
     (( here == 0 )) || needle="\"key\":\"$(json_escape "$(repo_root)")::"
-    out="$(BL_NEEDLE="$needle" awk -v cutoff="$cutoff" -v light_mb="$light_max_mb" -v light_s="$light_max_seconds" "$awk_json_lib"'
+    out="$(BL_NEEDLE="$needle" awk -v cutoff="$cutoff" -v light_mb="$light_max_mb" -v light_s="$light_max_seconds" \
+        -v short_mb="$light_short_max_mb" -v short_s="$light_short_max_seconds" "$awk_json_lib"'
         BEGIN { needle = ENVIRON["BL_NEEDLE"] }
         /^\{/ && (needle == "" || index($0, needle)) {
             key = jstr($0, "key"); if (key == "") next
@@ -1490,6 +1706,7 @@ cmd_stats() {
                 for (q = 1; q <= np; q++) { split(parts[q], kv, ":"); gsub(/"/, "", kv[1]); reason_s[kv[1]] += kv[2] }
             }
             all++; all_run += run; all_wait += wait; if (jnum($0, "exit") != "0") all_fail++; wait_count[wait]++
+            adm = jstr($0, "admission"); if (adm != "") admissions[adm]++
         }
         END {
             for (key in n) {
@@ -1501,8 +1718,9 @@ cmd_stats() {
                 peak = pct(b, w, 0.9); est = ""; lane = "heavy"
                 if (w >= 3) {
                     est = int(peak * 1.25 + 256); if (est < 512) est = 512
-                    if (key ~ /::light$/) { if (est <= light_mb) lane = "light" }
-                    else if (key !~ /::heavy$/ && est <= light_mb && pct(r, w, 0.9) <= light_s) lane = "light"
+                    short = est <= short_mb && pct(r, w, 0.9) <= short_s
+                    if (key ~ /::light$/) { if (est <= light_mb || short) lane = "light" }
+                    else if (key !~ /::heavy$/ && ((est <= light_mb && pct(r, w, 0.9) <= light_s) || short)) lane = "light"
                 } else lane = "new"
                 printf "%d\037%d\037%d\037%d\037%d\037%d\037%s\037%s\037%d\037%s\n", trun[key], m, fails[key], p50, p90, peak, est, lane, twait[key] / m, key
             }
@@ -1513,10 +1731,12 @@ cmd_stats() {
             for (i = 1; i <= d; i++) { seen_n += wait_count[dv[i]]; if (seen_n >= target) { p90w = dv[i]; break } }
             printf "#\037%d\037%d\037%d\037%d\037%d\n", all, all_run, all_wait, p90w, all_fail
             for (rn in reason_s) printf "@\037%s\037%d\n", rn, reason_s[rn]
+            for (an in admissions) printf "%%\037%s\037%d\n", an, admissions[an]
         }' "${files[@]}" 2>/dev/null)"
     summary="$(grep '^#' <<< "$out" || true)"
     mapfile -t reason_rows < <(grep '^@' <<< "$out" | sort -t $'\x1f' -k3,3nr || true)
-    mapfile -t rows < <(grep -v '^[#@]' <<< "$out" | sort -t $'\x1f' -k1,1nr | head -n "$limit")
+    mapfile -t admission_rows < <(grep '^%' <<< "$out" | sort -t $'\x1f' -k3,3nr || true)
+    mapfile -t rows < <(grep -v '^[#@%]' <<< "$out" | sort -t $'\x1f' -k1,1nr | head -n "$limit")
     local all all_run all_wait p90_wait all_fail reason_name reason_secs reason_json='' reason_text='' reason_sep=''
     IFS=$'\x1f' read -r _ all all_run all_wait p90_wait all_fail <<< "$summary"
     for row in "${reason_rows[@]}"; do
@@ -1526,6 +1746,15 @@ cmd_stats() {
         reason_text+="${reason_sep:+, }$reason_name $(fmt_dur "$reason_secs")"
         reason_sep=1
     done
+    # How jobs got in: free and idle as before; backfill and memory-relaxed for
+    # the starts past (or for) a heavy job waiting on memory.
+    local adm_json='' adm_text='' adm_name adm_count
+    for row in "${admission_rows[@]}"; do
+        IFS=$'\x1f' read -r _ adm_name adm_count <<< "$row"
+        [[ "$adm_name" =~ ^[a-z-]+$ ]] || continue
+        adm_json+="${adm_json:+,}\"$adm_name\":$adm_count"
+        [[ "$adm_name" == free || "$adm_name" == idle ]] || adm_text+="${adm_text:+, }$adm_name $adm_count"
+    done
     if (( json == 1 )); then
         printf '{"days":%s,"jobs":%s,"runSeconds":%s,"waitSeconds":%s,"p90WaitSeconds":%s,"failed":%s,"commands":[' "$days" "${all:-0}" "${all_run:-0}" "${all_wait:-0}" "${p90_wait:-0}" "${all_fail:-0}"
         for row in "${rows[@]}"; do
@@ -1534,7 +1763,7 @@ cmd_stats() {
                 "$(json_escape "$key")" "$n" "$fails" "$total_run" "$p50" "$p90" "$peak" "${est:-null}" "$lane" "$avg_wait"
             sep=','
         done
-        printf '],"waitReasons":{%s}}\n' "$reason_json"
+        printf '],"waitReasons":{%s},"admissions":{%s}}\n' "$reason_json" "$adm_json"
         return 0
     fi
     if [[ ! "${all:-}" =~ ^[0-9]+$ ]] || (( all == 0 )); then
@@ -1544,6 +1773,7 @@ cmd_stats() {
     printf '%s%s jobs%s in the last %s days %s ran %s %s waited %s (p90 wait %s) %s %s%% failed\n\n' "$c_bold" "$all" "$c_reset" "$days" "$s_dot" \
         "$(fmt_dur "$all_run")" "$s_dot" "$(fmt_dur "$all_wait")" "$(fmt_dur "$p90_wait")" "$s_dot" $(( all_fail * 100 / all ))
     [[ -z "$reason_text" ]] || printf 'Waiting by reason: %s\n\n' "$reason_text"
+    [[ -z "$adm_text" ]] || printf 'Starts around memory waits: %s\n\n' "$adm_text"
     width="$(term_width)"
     cmd_w=$(( width - 2 - 5 - 5 - 8 - 8 - 8 - 9 - 6 - 8 - 9 ))
     (( cmd_w >= 20 )) || cmd_w=20
@@ -1565,7 +1795,7 @@ cmd_stats() {
 # config
 
 # KEY|type|variable holding the effective value|summary. Types: int, num,
-# hours, onoff, quiet, path.
+# hours, onoff, quiet (auto, on or off), path.
 settings_table() {
     cat <<'EOF'
 SLOTS|int|slots|Heavy jobs at once on a busy machine (default: cores / WORKERS)
@@ -1584,7 +1814,14 @@ DEFAULT_MEMORY_MB|mb|default_heavy_mb|Assumed peak memory of a heavy command wit
 DEFAULT_LIGHT_MEMORY_MB|mb|default_light_mb|Assumed peak memory of a light command with no history yet
 LIGHT_MAX_MB|mb|light_max_mb|A command that peaks under this much memory...
 LIGHT_MAX_SECONDS|int|light_max_seconds|...and finishes within this many seconds moves to the light lane on its own
+LIGHT_SHORT_MAX_MB|mb|light_short_max_mb|A command that peaks under this much memory... (default: RAM / 8, at most 5120)
+LIGHT_SHORT_MAX_SECONDS|int|light_short_max_seconds|...and finishes within this many seconds moves to the light lane too
 RAMP_SECONDS|int|ramp_seconds|For this long after it starts, a job may still grow toward its memory budget
+BACKFILL_MAX_SECONDS|int|backfill_max_seconds|A heavy command learned to finish within this many seconds may start ahead of a heavy job waiting for memory (0: never)
+MEMORY_RELAX_SECONDS|int|memory_relax_seconds|After waiting this long on memory held outside buildlock, a heavy job needs only CRITICAL_MEMORY_MB free after it (0: never)
+STALL_SECONDS|int|stall_seconds|A running job that used under STALL_CPU_SECONDS of CPU for this long shows as stalled in status and doctor
+STALL_CPU_SECONDS|int|stall_cpu_seconds|CPU seconds a job's processes must use to count as active
+KEEP_ORPHANS|quiet|keep_orphans|A queued job whose caller exited: off leaves the queue (exit 74), on still runs it, auto keeps it under nohup or setsid or with output to a file
 IDLE_LOAD_RATIO|num|idle_load_ratio|The machine counts as idle below cores x this expected load
 PROFILE|onoff|profile_mode|Learn each command's memory and run time from the job log
 JOB_LOG_DIR|path|job_log_dir|Where the job log is kept
@@ -1810,7 +2047,7 @@ config_set() {
         if [[ "$value" == default || -z "$value" ]]; then config_unset "$key"; return 0; fi
         validate_setting "$type" "$value" || die "$key needs $(type_hint "$type"), not '$value'"
         if [[ "$type" == mb ]]; then parse_mb "$value"; value="$REPLY"; fi
-        if [[ "$value" == 0 ]] && [[ "${key#QUIET_}" =~ ^(SLOTS|WORKERS|CORES|MAX_JOBS|LIGHT_SLOTS|LIGHT_MAX_JOBS|DEFAULT_MEMORY_MB|DEFAULT_LIGHT_MEMORY_MB)$ ]]; then
+        if [[ "$value" == 0 ]] && [[ "${key#QUIET_}" =~ ^(SLOTS|WORKERS|CORES|MAX_JOBS|LIGHT_SLOTS|LIGHT_MAX_JOBS|DEFAULT_MEMORY_MB|DEFAULT_LIGHT_MEMORY_MB|STALL_SECONDS|STALL_CPU_SECONDS)$ ]]; then
             die "$key must be at least 1"
         fi
     elif (( force == 0 )); then
@@ -2974,6 +3211,20 @@ cmd_doctor() {
         note "  nothing starts while less than $(fmt_mb "$critical_memory_mb") is free$([[ "$avail" =~ ^[0-9]+$ ]] && printf ' (%s free now)' "$(fmt_mb "$avail")")"
     fi
     note "  change them: buildlock config"
+    local holders slot pid started stalled stalled_n=0
+    holders="$(live_holders)"
+    if [[ -n "$holders" ]]; then
+        heading "Running jobs"
+        while IFS=$'\t' read -r slot pid started _; do
+            [[ -n "$pid" ]] || continue
+            stalled="$(stalled_for "$pid" "${started:-}")"
+            [[ -n "$stalled" ]] || continue
+            stalled_n=$(( stalled_n + 1 ))
+            warn "pid $pid ($(clip "$(tilde "$(pid_command "$pid")")" 50)) stalled $(fmt_dur "$stalled"): under ${stall_cpu_seconds}s of CPU in that time"
+            note "    it keeps its slot; a build that works through a daemon (Gradle, Bazel, Docker) looks like this too, so check before stopping it"
+        done <<< "$holders"
+        (( stalled_n > 0 )) || ok "$(grep -c . <<< "$holders") running, none stalled"
+    fi
 
     heading "Coding agents"
     local knows=() unset_agents=() project_only=()
@@ -3292,10 +3543,12 @@ Options:
   --memory SIZE       memory it needs until learned (MB, or 512M, 2G)
   --timeout SECONDS   stop waiting after this long and exit with 73
 
-Exit codes: the command's own; 73 gave up waiting; 126 not executable;
-127 command not found; 129/130/131/143 cancelled by HUP/INT/QUIT/TERM.
+Exit codes: the command's own; 73 gave up waiting; 74 its caller exited while
+it was queued; 126 not executable; 127 command not found; 129/130/131/143
+cancelled by HUP/INT/QUIT/TERM.
 Environment: BUILDLOCK_CLASS, BUILDLOCK_JOB_MEMORY_MB and BUILDLOCK_TIMEOUT
-do the same as the options; BUILDLOCK_BYPASS=1 runs without queueing.
+do the same as the options; BUILDLOCK_BYPASS=1 runs without queueing;
+BUILDLOCK_KEEP_ORPHANS=1 keeps a queued job whose caller exits (nohup does too).
 EOF
 }
 
@@ -3504,12 +3757,125 @@ not_found_hint() {
 # every bit of memory that frees up: "pid<TAB>since<TAB>budget_mb".
 heavy_wait_file() { printf '%s.heavywait' "$lock_path"; }
 
-# The extra memory a light job must leave free for a starved heavy head, or 0.
-heavy_wait_reserve() {
+# Sets hw_pid, hw_since and hw_budget from the heavywait file while the waiter
+# it names is alive; fails (and empties them) otherwise.
+read_heavy_wait() {
     local pid since budget
-    IFS=$'\t' read -r pid since budget 2>/dev/null < "$(heavy_wait_file)" || { printf 0; return; }
-    if [[ "$since" =~ ^[0-9]+$ && "$budget" =~ ^[0-9]+$ ]] && (( EPOCHSECONDS - since >= heavy_starve_seconds )) && job_alive "$pid" "$since"; then
-        printf '%s' "$budget"
+    hw_pid='' hw_since='' hw_budget=''
+    IFS=$'\t' read -r pid since budget 2>/dev/null < "$(heavy_wait_file)" || return 1
+    [[ "$since" =~ ^[0-9]+$ && "$budget" =~ ^[0-9]+$ ]] && job_alive "$pid" "$since" || return 1
+    hw_pid="$pid" hw_since="$since" hw_budget="$budget"
+}
+
+# Sets ramping_n to the jobs in $1 ("pid:started:memory_mb" list, both lanes)
+# still inside their ramp-up window, which may yet grow toward their budget.
+ramping_count() {
+    local job pid started budget
+    ramping_n=0
+    for job in $1; do
+        IFS=: read -r pid started budget <<< "$job"
+        if [[ "$started" =~ ^[0-9]+$ ]] && (( EPOCHSECONDS - started < ramp_seconds )); then ramping_n=$(( ramping_n + 1 )); fi
+    done
+}
+
+# Sets held_mb to the resident memory, in MB, of the running jobs in $1
+# ("pid:started:memory_mb" list): what their ends would give back.
+held_mb=0
+jobs_held_mb() {
+    local job pid pids='' rss
+    held_mb=0
+    for job in $1; do
+        pid="${job%%:*}"
+        [[ "$pid" =~ ^[0-9]+$ ]] && pids+="${pids:+ }$pid"
+    done
+    [[ -n "$pids" ]] || return 0
+    while read -r rss; do
+        [[ "$rss" =~ ^[0-9]+$ ]] && held_mb=$(( held_mb + rss / 1024 ))
+    done < <(tree_rss_kb "$pids")
+}
+
+# Sets avail_now to MemAvailable in MB (0 when unknown), with builtins.
+read_avail() {
+    local key value
+    avail_now=0
+    while read -r key value _; do
+        if [[ "$key" == MemAvailable: && "$value" =~ ^[0-9]+$ ]]; then avail_now=$(( value / 1024 )); return 0; fi
+    done 2>/dev/null < "$proc_root/meminfo" || true
+}
+
+# The heavy head's verdict for budget $1, waiting on memory since epoch $2
+# (empty: it has not), from heavy_count, light_count, jobs and idle in the
+# caller. Sets hv_reason (empty: it may start) and hv_relaxed=1 when only the
+# relaxed memory check admits it: after MEMORY_RELAX_SECONDS on memory with no
+# job of either lane ramping up, waiting no longer frees memory buildlock
+# accounts for (the shortfall is held outside it), so the critical floor is
+# kept free after its budget instead of the full reserve.
+heavy_verdict() {
+    local budget="$1" since="${2:-}" relaxed
+    hv_relaxed=0
+    hv_reason="$(job_memory_mb="$budget"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    [[ "$hv_reason" == 'memory: '* && "$since" =~ ^[0-9]+$ ]] || return 0
+    (( memory_relax_seconds > 0 && EPOCHSECONDS - since >= memory_relax_seconds )) || return 0
+    ramping_count "$jobs"
+    (( ramping_n == 0 )) || return 0
+    # Jobs buildlock runs give their memory back when they end: wait for them
+    # while that alone would leave the full reserve free after this budget.
+    jobs_held_mb "$jobs"
+    read_avail
+    (( avail_now > 0 && avail_now + held_mb - budget < reserve_memory_mb )) || return 0
+    relaxed="$(job_memory_mb="$budget"; reserve_memory_mb="$critical_memory_mb"; wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    if [[ -z "$relaxed" ]]; then hv_reason=''; hv_relaxed=1; fi
+}
+
+# Succeeds while a heavy head (budget $1, on memory since epoch $2; $3 = the
+# running jobs) is protected: from HEAVY_STARVE_SECONDS on, light jobs keep its
+# budget free and no heavy job backfills past it, so neither stream can starve
+# it. A hopeless head is not protected: with no job ramping up, even the relaxed
+# check (critical floor) could not admit it, so only memory freed outside the
+# jobs that start now can help, and short jobs may go meanwhile. Any start makes
+# a job ramp, which protects the head again until that job settles or ends:
+# between two such starts the head always gets a clean check.
+head_protected() {
+    (( EPOCHSECONDS - $2 >= heavy_starve_seconds )) || return 1
+    ramping_count "$3"
+    (( ramping_n == 0 )) || return 0
+    ! backfill_running || return 0
+    read_avail
+    (( avail_now <= 0 || avail_now - $1 >= critical_memory_mb ))
+}
+
+# The marker a job admitted by backfill keeps while it runs.
+backfill_marker() { printf '%s.backfilled.%s' "$lock_path" "$1"; }
+
+# Succeeds while a job admitted by backfill still runs; drops markers whose
+# job is gone (a kill -9 skips its cleanup).
+backfill_running() {
+    local file pid since found=1
+    for file in "$lock_path".backfilled.*; do
+        [[ -e "$file" ]] || continue
+        pid="${file##*.}"
+        since=''
+        read -r since 2>/dev/null < "$file" || true
+        if [[ "$pid" =~ ^[0-9]+$ && "$since" =~ ^[0-9]+$ ]] && job_alive "$pid" "$since"; then found=0; else rm -f "$file" 2>/dev/null || true; fi
+    done
+    return "$found"
+}
+
+# Succeeds when a later heavy job may backfill past head $1: the head waits on
+# memory (its own verdict, recomputed here) and is not protected. Needs
+# heavy_count, light_count, jobs and idle in the caller; sets hv_*.
+backfill_open() {
+    read_heavy_wait && [[ "$hw_pid" == "$1" ]] || return 1
+    heavy_verdict "$hw_budget" "$hw_since"
+    [[ "$hv_reason" == 'memory: '* ]] || return 1
+    ! head_protected "$hw_budget" "$hw_since" "$jobs"
+}
+
+# The extra memory a light job must leave free for a protected heavy head
+# ($1 = the running jobs), or 0.
+heavy_wait_reserve() {
+    if read_heavy_wait && head_protected "$hw_budget" "$hw_since" "${1-}"; then
+        printf '%s' "$hw_budget"
     else
         printf 0
     fi
@@ -3518,7 +3884,7 @@ heavy_wait_reserve() {
 # wait_reason for the light lane. A heavy head starved of memory for a while
 # gets its budget kept free too, counted in the reserve.
 light_wait_reason() {
-    local reserve_memory_mb=$(( reserve_memory_mb + $(heavy_wait_reserve) ))
+    local reserve_memory_mb=$(( reserve_memory_mb + $(heavy_wait_reserve "$2") ))
     wait_reason "$@"
 }
 
@@ -3632,6 +3998,7 @@ main() {
     admission_mode=free
     sampler_pid=''
     peak_file=''
+    activity=''
     peak_mb=0
     last_wait_reason=''
     poll_reason=''
@@ -3640,6 +4007,34 @@ main() {
     wait_cat=''
     announced=0
     heavy_waiting=0
+    heavy_wait_since=''
+    # The caller, to notice when it exits while this job is still queued: its
+    # child is then reparented (to init or a subreaper such as systemd --user),
+    # so any change of the parent pid means the caller is gone.
+    caller_pid="$PPID"
+    keep_queued=0
+    case "$keep_orphans" in
+        1|on|yes|true) keep_queued=1 ;;
+        0|off|no|false) ;;
+        *)
+            # Kept when the caller set it up to outlive it: SIGHUP ignored
+            # (nohup), its own session (setsid), or output redirected to a file of
+            # its own that someone can read later (`buildlock cmd > log &`). Output
+            # shared with the caller (a pipe, a terminal, an agent tool's output
+            # file) has nobody left reading it once the caller is gone.
+            while read -r _key _value; do
+                [[ "$_key" == SigIgn: ]] || continue
+                if [[ "$_value" =~ ^[0-9a-fA-F]+$ ]] && (( 16#$_value & 1 )); then keep_queued=1; fi
+                break
+            done 2>/dev/null < "/proc/$self_pid/status" || true
+            if proc_info "$self_pid" && [[ "$proc_session" == "$self_pid" ]]; then keep_queued=1; fi
+            for _fd in 1 2; do
+                if [[ -f "/proc/$self_pid/fd/$_fd" ]] && ! [[ "/proc/$self_pid/fd/$_fd" -ef "/proc/$caller_pid/fd/$_fd" ]]; then keep_queued=1; fi
+            done
+            unset _fd
+            unset _key _value
+            ;;
+    esac
 
     # In the foreground of a terminal (an interactive shell, a script run from
     # one) the command stays in buildlock's process group and session: it keeps
@@ -3684,6 +4079,13 @@ main() {
             command_result="$cancel_status"
             finish "$command_result"
         fi
+        # Nobody reads the result of a job whose caller has gone: leave the
+        # queue instead of running it later. Only while queued; a running job
+        # is never touched.
+        if (( keep_queued == 0 )) && proc_info "$self_pid" && [[ "$proc_ppid" != "$caller_pid" ]]; then
+            say "buildlock: the caller (pid $caller_pid) exited while this job was queued; left the queue, the command did not run (BUILDLOCK_KEEP_ORPHANS=1 keeps such jobs)"
+            exit 74
+        fi
         # Something removed the queue file (a cleanup of ~/.cache, a waiter in a
         # sandbox that could not see this pid): put it back, same place in line.
         [[ -e "$queue_file" ]] || write_queue_file || true
@@ -3691,21 +4093,24 @@ main() {
         account_wait
         was_head=0
         if { [[ "$job_class" == light ]] && [[ "$light_head_pid" == "$self_pid" ]]; } \
-            || { [[ "$job_class" != light ]] && [[ "$head_pid" == "$self_pid" ]]; }; then
+            || { [[ "$job_class" != light ]] && [[ "$head_pid" == "$self_pid" ]]; } \
+            || { [[ "$backfill_pid" == "$self_pid" ]] && [[ -e "$(heavy_wait_file)" ]]; }; then
             # Set before flock: a Ctrl-Z that lands as flock returns must not
             # stop this waiter while it holds the mutex.
             in_sched=1
             started=0
             was_head=1
+            [[ "$head_pid" == "$self_pid" || "$light_head_pid" == "$self_pid" ]] || was_head=2
             poll_reason=''
             if flock -w 30 "$sched_fd"; then
-                # Re-check under the mutex; only this lane's head ever takes a slot.
+                # Re-check under the mutex; only this lane's head, or the heavy
+                # lane's backfill candidate, ever takes a slot.
                 scan_queue
                 started=1
                 if [[ "$job_class" == light ]]; then
                     [[ "$light_head_pid" == "$self_pid" ]] && try_start || started=0
                 else
-                    [[ "$head_pid" == "$self_pid" ]] && try_start || started=0
+                    [[ "$head_pid" == "$self_pid" || "$backfill_pid" == "$self_pid" ]] && try_start || started=0
                 fi
                 flock -u "$sched_fd"
             fi
@@ -3719,10 +4124,11 @@ main() {
             if (( pending_stop == 1 )); then pending_stop=0; kill -STOP "$self_pid"; fi
         fi
         # What blocks this poll: the verdict try_start just got when this job is
-        # its lane's head, else the queue order. A head that lost the mutex keeps
-        # its last category.
+        # its lane's head (or a backfill try that met its own checks), else the
+        # queue order. A head that lost the mutex keeps its last category.
         if (( was_head == 0 )); then wait_cat=order
         elif [[ -n "$poll_reason" ]]; then wait_category "$poll_reason"
+        elif (( was_head == 2 )); then wait_cat=order
         else wait_cat="${wait_cat:-order}"; fi
         # One notice once a job has waited 2 seconds, so a person or an agent
         # reading the output knows it is queued, not hung.
@@ -3773,10 +4179,15 @@ main() {
         lane_slots="$slots"
         lane_cap="$max_jobs"
         if [[ "$my_class" == light ]]; then lane_word='light '; lane_slots="$light_slots"; lane_cap="$light_max_jobs"; fi
+        how=''
+        case "$admission_mode" in
+            backfill) how='; ahead of a job waiting for memory, as a short one' ;;
+            memory-relaxed) how='; memory held outside buildlock, so only the critical floor was kept free' ;;
+        esac
         if (( my_slot + 1 > lane_slots )); then
-            say "buildlock: waited ${waited}s (${lane_word}slot $(( my_slot + 1 )) of up to $lane_cap: the machine is idle)"
+            say "buildlock: waited ${waited}s (${lane_word}slot $(( my_slot + 1 )) of up to $lane_cap: the machine is idle$how)"
         else
-            say "buildlock: waited ${waited}s (${lane_word}slot $(( my_slot + 1 )) of $lane_slots)"
+            say "buildlock: waited ${waited}s (${lane_word}slot $(( my_slot + 1 )) of $lane_slots$how)"
         fi
     fi
 
@@ -3840,7 +4251,9 @@ stop_waiter() {
 # tells a waiter that cannot see this pid (another PID namespace) that the
 # entry is still alive.
 write_queue_file() {
-    printf '%s\t%s\t%s\tscheduled\t%s\t%s\n' "$self_pid" "$queued_at" "$PWD" "$queued_us" "$job_class" > "$queue_temp" 2>/dev/null || return 1
+    local fill=-
+    ! backfill_eligible || fill=backfill
+    printf '%s\t%s\t%s\tscheduled\t%s\t%s\t%s\n' "$self_pid" "$queued_at" "$PWD" "$queued_us" "$job_class" "$fill" > "$queue_temp" 2>/dev/null || return 1
     mv -f "$queue_temp" "$queue_file" 2>/dev/null || return 1
     if [[ -n "$queue_fd" ]]; then exec {queue_fd}<&-; queue_fd=''; fi
     # (A plain `exec ... 2>/dev/null` would silence this shell's stderr for good.)
@@ -3854,22 +4267,31 @@ say() {
     trap - PIPE
 }
 
-# Background peak-RSS sampler for this job's process tree (tree_rss_kb on
-# $self_pid), first sampling one interval in, so short jobs pay nothing. It is
+# Background peak-RSS sampler for this job's process tree (tree_usage on
+# $self_pid), first sampling one interval in, so short jobs pay nothing; it also
+# keeps the activity file that shows a stalled job in status. It is
 # also the job's watchdog: started in a process group of its own, it outlives a
 # `kill -9` of buildlock or of buildlock's process group, and then stops the
 # command left behind (which would otherwise run on outside the queue) and
 # exits. It pauses with `read -t` instead of an external sleep and has no
 # stdio, so nothing it starts can outlive it holding the job's output pipes.
 start_sampler() {
-    local parent_start=''
+    local parent_start='' hz
     peak_file="${TMPDIR:-/tmp}/buildlock-peak.$self_pid"
     printf '0\n' 2>/dev/null > "$peak_file" || peak_file=''
+    activity="$(activity_file "$self_pid")"
+    printf '%s\t0\n' "$EPOCHSECONDS" 2>/dev/null > "$activity" || activity=''
+    hz="$(getconf CLK_TCK 2>/dev/null)" || hz=100
+    [[ "$hz" =~ ^[1-9][0-9]*$ ]] || hz=100
     if proc_info "$self_pid"; then parent_start="$proc_start"; fi
     set -m
     (
         exec {slot_fd}>&- </dev/null >/dev/null 2>&1
         exec {pause_fd}<> <(:)
+        # Stall tracking: the last time the tree's CPU time grew by the stall
+        # threshold, written at most every STALL_SECONDS / 10 while the job is
+        # busy, and at once when a sample finds it quiet.
+        active_since="$EPOCHSECONDS" active_cpu=0 written_since="$EPOCHSECONDS" written_at="$EPOCHSECONDS"
         while :; do
             read -r -t "$sample_seconds" -u "$pause_fd" _ || true
             if ! proc_info "$self_pid" || [[ "$proc_state" == [ZX] || "$proc_start" != "$parent_start" ]]; then
@@ -3883,15 +4305,28 @@ start_sampler() {
                     kill -KILL "$command_pid" 2>/dev/null || true
                 fi
                 [[ -z "$peak_file" ]] || rm -f "$peak_file"
+                [[ -z "$activity" ]] || rm -f "$activity"
                 exit 0
             fi
-            [[ -n "$peak_file" ]] || continue
-            rss="$(tree_rss_kb "$self_pid")"
-            [[ "$rss" =~ ^[0-9]+$ ]] || rss=0
-            peak_kb=0
-            read -r peak_kb < "$peak_file" || true
-            [[ "$peak_kb" =~ ^[0-9]+$ ]] || peak_kb=0
-            (( rss <= peak_kb )) || printf '%s\n' "$rss" > "$peak_file"
+            [[ -n "$peak_file$activity" ]] || continue
+            rss=0 cpu=''
+            read -r rss cpu <<< "$(tree_usage "$self_pid" "$BASHPID" "$hz")" || true
+            if [[ -n "$peak_file" ]]; then
+                [[ "$rss" =~ ^[0-9]+$ ]] || rss=0
+                peak_kb=0
+                read -r peak_kb < "$peak_file" || true
+                [[ "$peak_kb" =~ ^[0-9]+$ ]] || peak_kb=0
+                (( rss <= peak_kb )) || printf '%s\n' "$rss" > "$peak_file"
+            fi
+            [[ -n "$activity" && "$cpu" =~ ^[0-9]+$ ]] || continue
+            busy=0
+            # Less CPU than before: a process left the tree, which is not work.
+            if (( cpu < active_cpu )); then active_cpu="$cpu"
+            elif (( cpu - active_cpu >= stall_cpu_seconds )); then active_cpu="$cpu"; active_since="$EPOCHSECONDS"; busy=1; fi
+            if (( active_since != written_since )) && (( busy == 0 || EPOCHSECONDS - written_at >= stall_seconds / 10 )); then
+                printf '%s\t%s\n' "$active_since" "$active_cpu" > "$activity.tmp" && mv -f "$activity.tmp" "$activity" || true
+                written_since="$active_since" written_at="$EPOCHSECONDS"
+            fi
         done
     ) &
     sampler_pid=$!
@@ -3910,6 +4345,8 @@ stop_sampler() {
     fi
     [[ -z "$peak_file" ]] || rm -f "$peak_file" 2>/dev/null || true
     peak_file=''
+    [[ -z "${activity:-}" ]] || rm -f "$activity" "$activity.tmp" 2>/dev/null || true
+    activity=''
 }
 
 # Maps a wait_reason verdict to the short name logged in waitReasons. Pure
@@ -3985,6 +4422,7 @@ cleanup() {
         command_stdin_fd=''
     fi
     rm -f "$queue_file" "$queue_temp"
+    [[ "${admission_mode:-}" != backfill ]] || rm -f "$(backfill_marker "$self_pid")" 2>/dev/null || true
     if (( heavy_waiting == 1 )); then
         IFS=$'\t' read -r pid _ 2>/dev/null < "$(heavy_wait_file)" || true
         [[ "$pid" != "$self_pid" ]] || rm -f "$(heavy_wait_file)"
@@ -4090,10 +4528,11 @@ needs_idle_path() {
 
 # Holding the scheduler mutex: start in a free slot if wait_reason allows. A
 # lane's slot scan reaches its hard cap only while idle; otherwise it stops at
-# the lane's normal slot count. The refusal reason is kept in last_wait_reason
-# for the one-time "waiting" notice.
+# the lane's normal slot count. A heavy job that is not the head gets here only
+# as the backfill candidate. The refusal reason is kept in last_wait_reason for
+# the one-time "waiting" notice.
 try_start() {
-    local summary heavy_count light_count jobs reason slot first_slot=0 fd scan_limit
+    local summary heavy_count light_count jobs reason slot first_slot=0 fd scan_limit relaxed=0 gap_skip=1
     summary="$(running_summary)"
     read -r heavy_count light_count jobs <<< "$summary"
     # The idle probe costs processes, so it runs only when it could change the
@@ -4110,7 +4549,11 @@ try_start() {
     if [[ "$job_class" == light ]]; then
         scan_limit="$light_slots"
         (( idle == 0 )) || scan_limit="$light_max_jobs"
-        reason="$(light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" 1 "$light_count" "$light_max_jobs" "$idle")"
+        # A short-light job above LIGHT_MAX_MB uses most cores while it runs: it
+        # keeps the start gap, so a burst of them cannot outrun the load average.
+        gap_skip=1
+        (( job_memory_mb <= light_max_mb )) || gap_skip=0
+        reason="$(light_wait_reason "$(( heavy_count + light_count ))" "$jobs" "$light_slots" "$gap_skip" "$light_count" "$light_max_jobs" "$idle")"
         if [[ -n "$reason" ]]; then last_wait_reason="$reason"; poll_reason="$reason"; return 1; fi
         admission_mode=free
         (( idle == 0 )) || ! needs_idle_path "$light_count" "$light_slots" 1 || admission_mode=idle
@@ -4122,6 +4565,9 @@ try_start() {
                 my_class=light
                 printf '%s\t%s\t%s\t%s\t%s\n' "$self_pid" "$EPOCHSECONDS" "$PWD" "$job_memory_mb" light > "$(slot_holder "$slot" light).$self_pid.tmp"
                 mv -f "$(slot_holder "$slot" light).$self_pid.tmp" "$(slot_holder "$slot" light)"
+                if (( gap_skip == 0 )); then
+                    printf '%s\n' "$EPOCHSECONDS" > "$started_file.$self_pid.tmp" && mv -f "$started_file.$self_pid.tmp" "$started_file"
+                fi
                 rm -f "$queue_file"
                 return 0
             fi
@@ -4133,19 +4579,33 @@ try_start() {
     fi
     scan_limit="$slots"
     (( idle == 0 )) || scan_limit="$max_jobs"
-    reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+    if [[ "$head_pid" == "$self_pid" ]]; then
+        heavy_verdict "$job_memory_mb" "$heavy_wait_since"
+        reason="$hv_reason"
+        relaxed="$hv_relaxed"
+    else
+        # A backfill try: only past a head that waits on memory and is not
+        # protected, and only when this job passes every check on its own.
+        backfill_open "$head_pid" || { poll_reason=''; return 1; }
+        reason="$(wait_reason "$(( heavy_count + light_count ))" "$jobs" "$slots" 0 "$heavy_count" "$max_jobs" "$idle")"
+        relaxed=0
+    fi
     if [[ -n "$reason" ]]; then
         last_wait_reason="$reason"
         poll_reason="$reason"
-        # Waiting on memory: publish it once, for heavy_wait_reserve.
-        if [[ "$reason" == 'memory: '* && "$heavy_waiting" == 0 ]]; then
-            printf '%s\t%s\t%s\n' "$self_pid" "$EPOCHSECONDS" "$job_memory_mb" > "$(heavy_wait_file).$self_pid.tmp" 2>/dev/null \
+        # The head waiting on memory: publish it once, for heavy_wait_reserve,
+        # backfill_open and the relaxed check (which counts from here).
+        if [[ "$reason" == 'memory: '* && "$head_pid" == "$self_pid" ]] && { (( heavy_waiting == 0 )) || [[ ! -e "$(heavy_wait_file)" ]]; }; then
+            heavy_wait_since="${heavy_wait_since:-$EPOCHSECONDS}"
+            printf '%s\t%s\t%s\n' "$self_pid" "$heavy_wait_since" "$job_memory_mb" > "$(heavy_wait_file).$self_pid.tmp" 2>/dev/null \
                 && mv -f "$(heavy_wait_file).$self_pid.tmp" "$(heavy_wait_file)" 2>/dev/null && heavy_waiting=1
         fi
         return 1
     fi
     admission_mode=free
     (( idle == 0 )) || ! needs_idle_path "$heavy_count" "$slots" 0 || admission_mode=idle
+    (( relaxed == 0 )) || admission_mode='memory-relaxed'
+    [[ "$head_pid" == "$self_pid" ]] || admission_mode=backfill
     # Let waiters of the previous script drain through slot 0.
     (( legacy_waiting == 0 || scan_limit <= 1 )) || first_slot=1
     for (( slot = first_slot; slot < scan_limit; slot++ )); do
@@ -4158,6 +4618,7 @@ try_start() {
             mv -f "$(slot_holder "$slot").$self_pid.tmp" "$(slot_holder "$slot")"
             printf '%s\n' "$EPOCHSECONDS" > "$started_file.$self_pid.tmp"
             mv -f "$started_file.$self_pid.tmp" "$started_file"
+            [[ "$admission_mode" != backfill ]] || printf '%s\n' "$EPOCHSECONDS" > "$(backfill_marker "$self_pid")" 2>/dev/null || true
             rm -f "$queue_file"
             if (( heavy_waiting == 1 )); then rm -f "$(heavy_wait_file)"; heavy_waiting=0; fi
             return 0

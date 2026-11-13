@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -57,8 +57,8 @@ function fixture(machine: Partial<IMachine> = {}, slots = 1, lightSlots = 1): { 
     };
 }
 
-function start(args: string[], env: NodeJS.ProcessEnv) {
-    return spawn(script, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+function start(args: string[], env: NodeJS.ProcessEnv, cwd?: string) {
+    return spawn(script, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 async function finished(child: ReturnType<typeof start>, timeoutMs = 3_000): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -79,7 +79,7 @@ async function finished(child: ReturnType<typeof start>, timeoutMs = 3_000): Pro
 }
 
 async function waitFor(path: string): Promise<void> {
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (let attempt = 0; attempt < 300; attempt++) {
         if (existsSync(path)) {
             return;
         }
@@ -399,3 +399,244 @@ test('a job queued behind another one logs its wait as order', async () => {
         holder.kill('SIGTERM');
     }
 });
+
+/** Three job-log runs of `cmd` in `cwd` (not a git checkout, so its key is `cwd::cmd`): a learned profile. */
+function learn(env: NodeJS.ProcessEnv, cwd: string, cmd: string, peakMb: number, runSeconds: number): void {
+    const logDir = env.BUILDLOCK_JOB_LOG_DIR as string;
+    mkdirSync(logDir, { recursive: true });
+    const at = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    const line = `{"at":"${at}","end":"${at}","pid":1,"cwd":"${cwd}","class":"heavy","budgetMb":2048,"waitSeconds":0,"runSeconds":${runSeconds},"exit":0,"cmd":"${cmd}","key":"${cwd}::${cmd}","peakMb":${peakMb},"budgetSource":"default","admission":"free"}\n`;
+    appendFileSync(resolve(logDir, `jobs-${new Date().toISOString().slice(0, 7)}.jsonl`), line.repeat(3));
+}
+
+function queued(lock: string): string[] {
+    return existsSync(`${lock}.queue`) ? readdirSync(`${lock}.queue`).filter((name) => /^\d+$/.test(name)) : [];
+}
+
+/** Memory-wait cases: no ramp-up growth (so only the budgets count) and a 1 GB critical floor. */
+function memoryFixture(availableMb: number, extra: NodeJS.ProcessEnv = {}) {
+    const fx = fixture({ availableMb }, 3, 1);
+    fx.env = { ...fx.env, BUILDLOCK_RAMP_SECONDS: '0', BUILDLOCK_CRITICAL_MEMORY_MB: '1024', ...extra };
+    return fx;
+}
+
+test('a short learned job backfills past a head waiting on memory; an unknown one does not', async () => {
+    // 10000 MB free - 9000 MB for the head < 2048 MB reserve. The short job
+    // needs 2756 MB and is learned to run 90 s: too big and long for the light lane.
+    const { root, lock, env } = memoryFixture(10_000);
+    learn(env, root, 'sleep 0.3', 2_000, 90);
+    const holder = start(['sleep', '30'], env, root);
+    await waitFor(`${lock}.holder`);
+    const head = start(['sleep', '0.1'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '9000' }, root);
+    try {
+        await waitFor(`${lock}.queue/${head.pid}`);
+        await Bun.sleep(300);
+        const unknown = await finished(start(['true'], { ...env, BUILDLOCK_TIMEOUT: '1.5' }, root), 4_000);
+        expect(unknown.code).toBe(73);
+        const short = await finished(start(['sleep', '0.3'], env, root), 6_000);
+        expect(short.code).toBe(0);
+        expect(queued(lock)).toContain(String(head.pid));
+        const entry = jobLog(env).find((line) => line.cmd === 'sleep 0.3' && line.pid !== 1) as Record<string, unknown>;
+        expect(entry.admission).toBe('backfill');
+        const status = await finished(start(['--status'], env, root));
+        expect(status.stdout).toContain('backfill=yes');
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+    expect((await finished(head, 6_000)).code).toBe(0);
+}, 20_000);
+
+test('backfill keeps arrival order: a later candidate never passes an earlier one that does not fit', async () => {
+    const { root, lock, env } = memoryFixture(10_000);
+    learn(env, root, 'sleep 0.2', 7_000, 90);
+    learn(env, root, 'sleep 0.3', 2_000, 90);
+    const holder = start(['sleep', '30'], env, root);
+    await waitFor(`${lock}.holder`);
+    const head = start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '9000' }, root);
+    try {
+        await waitFor(`${lock}.queue/${head.pid}`);
+        const big = start(['sleep', '0.2'], { ...env, BUILDLOCK_TIMEOUT: '2' }, root);
+        const bigDone = finished(big, 6_000);
+        await waitFor(`${lock}.queue/${big.pid}`);
+        const small = await finished(start(['sleep', '0.3'], { ...env, BUILDLOCK_TIMEOUT: '1.5' }, root), 4_000);
+        expect(small.code).toBe(73);
+        expect((await bigDone).code).toBe(73);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+        head.kill('SIGTERM');
+        await finished(head);
+    }
+}, 15_000);
+
+test('a head protected after the starvation limit stops backfill, unless even the floor cannot fit it', async () => {
+    const { root, lock, env } = memoryFixture(10_000, { BUILDLOCK_HEAVY_STARVE_SECONDS: '0' });
+    learn(env, root, 'sleep 0.3', 2_000, 90);
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        // 10000 - 8500 >= the 1024 MB floor: the head can still get in soon, so it is protected.
+        const head = start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '8500' }, root);
+        await waitFor(`${lock}.queue/${head.pid}`);
+        await Bun.sleep(300);
+        expect((await finished(start(['sleep', '0.3'], { ...env, BUILDLOCK_TIMEOUT: '1.5' }, root), 4_000)).code).toBe(73);
+        head.kill('SIGTERM');
+        await finished(head);
+        // 10000 - 9500 < 1024: only memory outside buildlock can help this head, so short jobs go.
+        const hopeless = start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '9500' }, root);
+        await waitFor(`${lock}.queue/${hopeless.pid}`);
+        await Bun.sleep(300);
+        expect((await finished(start(['sleep', '0.3'], env, root), 6_000)).code).toBe(0);
+        hopeless.kill('SIGTERM');
+        await finished(hopeless);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 20_000);
+
+test('a head waiting on memory nobody in buildlock will free starts on the critical floor after the relax time', async () => {
+    // 8500 - 7000 < 2048 reserve, but >= the 1024 MB floor.
+    const { root, lock, env } = memoryFixture(8_500, { BUILDLOCK_MEMORY_RELAX_SECONDS: '2' });
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        const head = await finished(start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '7000' }, root), 8_000);
+        expect(head.code).toBe(0);
+        expect(head.stderr).toContain('only the critical floor was kept free');
+        const entry = jobLog(env).find((line) => line.cmd === 'true') as Record<string, unknown>;
+        expect(entry.admission).toBe('memory-relaxed');
+        expect(entry.waitSeconds as number).toBeGreaterThanOrEqual(1);
+        expect((entry.waitReasons as Record<string, number>).memory).toBeGreaterThanOrEqual(1);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('MEMORY_RELAX_SECONDS=0 turns the relaxed memory check off', async () => {
+    const { root, lock, env } = memoryFixture(8_500, { BUILDLOCK_MEMORY_RELAX_SECONDS: '0' });
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        const head = await finished(start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '7000', BUILDLOCK_TIMEOUT: '2' }, root), 6_000);
+        expect(head.code).toBe(73);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('only one backfilled job runs at a time past a hopeless head', async () => {
+    const { root, lock, env } = memoryFixture(10_000, { BUILDLOCK_HEAVY_STARVE_SECONDS: '0' });
+    learn(env, root, 'sleep 2', 2_000, 90);
+    learn(env, root, 'sleep 0.3', 2_000, 90);
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        // 10000 - 9500 < the 1024 MB floor: hopeless, so short jobs may go, but one at a time.
+        const hopeless = start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '9500' }, root);
+        await waitFor(`${lock}.queue/${hopeless.pid}`);
+        await Bun.sleep(300);
+        const first = start(['sleep', '2'], env, root);
+        await waitFor(`${lock}.backfilled.${first.pid}`);
+        expect((await finished(start(['sleep', '0.3'], { ...env, BUILDLOCK_TIMEOUT: '1' }, root), 4_000)).code).toBe(73);
+        expect((await finished(first, 6_000)).code).toBe(0);
+        expect(existsSync(`${lock}.backfilled.${first.pid}`)).toBe(false);
+        hopeless.kill('SIGTERM');
+        await finished(hopeless);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 20_000);
+
+test('a short-light job above LIGHT_MAX_MB keeps the start gap', async () => {
+    const { root, lock, env } = memoryFixture(60_000, { BUILDLOCK_START_GAP: '30', BUILDLOCK_LIGHT_SHORT_MAX_MB: '5120' });
+    learn(env, root, 'sleep 0.2', 3_000, 10);
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        const short = await finished(start(['sleep', '0.2'], { ...env, BUILDLOCK_TIMEOUT: '1.5' }, root), 5_000);
+        expect(short.code).toBe(73);
+        expect(short.stderr).toMatch(/gap|ago/);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('the relaxed memory check waits while a job is still ramping up, and status says so', async () => {
+    const { root, lock, env } = memoryFixture(8_500, { BUILDLOCK_MEMORY_RELAX_SECONDS: '1', BUILDLOCK_RAMP_SECONDS: '240', BUILDLOCK_JOB_MEMORY_MB: '512' });
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        const head = start(['true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '7000', BUILDLOCK_TIMEOUT: '3' }, root);
+        await waitFor(`${lock}.heavywait`);
+        await Bun.sleep(1_500);
+        const status = await finished(start(['--status'], env, root));
+        expect(status.stdout).toContain('relaxed=no');
+        expect(status.stdout).toMatch(/next=memory: 8500MB available - \d+MB growth of ramping jobs - 7000MB/);
+        const human = await finished(start(['status'], env, root));
+        expect(human.stdout).toContain('once 1 job(s) starting up settle');
+        expect((await finished(head, 6_000)).code).toBe(73);
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 15_000);
+
+test('status and explain say when the relaxed memory check applies', async () => {
+    const { root, lock, env } = memoryFixture(8_500, { BUILDLOCK_MEMORY_RELAX_SECONDS: '2' });
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        // A head (the test process stands in for it) on memory for 5 seconds with a 7000 MB budget.
+        writeFileSync(`${lock}.heavywait`, `${process.pid}\t${Math.floor(Date.now() / 1000) - 5}\t7000\n`);
+        const stable = await finished(start(['--status'], env, root));
+        expect(stable.stdout).toContain('next=start');
+        expect(stable.stdout).toContain('relaxed=yes');
+        expect((await finished(start(['status'], env, root))).stdout).toContain('memory relaxed');
+        const explain = await finished(start(['--explain', 'true'], { ...env, BUILDLOCK_JOB_MEMORY_MB: '7000' }, root));
+        expect(explain.stdout).toContain('verdict: memory: ');
+        expect(explain.stdout).toContain('relaxed: start after 2s on memory');
+        expect(explain.stdout).toContain('backfill: no (fewer than 3 runs)');
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+});
+
+test('a short command takes the light lane with a larger memory cap; a long or larger one stays heavy', async () => {
+    const { root, env } = fixture();
+    const explain = async (cmd: string) => (await finished(start(['--explain', ...cmd.split(' ')], env, root))).stdout;
+    learn(env, root, 'sleep 1', 3_000, 9);
+    learn(env, root, 'sleep 2', 3_000, 150);
+    learn(env, root, 'sleep 3', 4_500, 9);
+    expect(await explain('sleep 1')).toContain('class: light budget=4006MB');
+    expect(await explain('sleep 2')).toContain('class: heavy budget=4006MB');
+    expect(await explain('sleep 3')).toContain('class: heavy budget=5881MB');
+    expect(await explain('sleep 3')).toContain('backfill: yes (learned p90 run 9s <= 120s)');
+    expect(await explain('sleep 2')).toContain('backfill: no (learned p90 run 150s > 120s)');
+    expect(await explain('sleep 1')).toContain('backfill: no (light lane)');
+});
+
+test('a short light job still leaves a protected heavy head its memory', async () => {
+    const { root, lock, env } = fixture({}, 2, 2);
+    env.BUILDLOCK_HEAVY_STARVE_SECONDS = '1';
+    learn(env, root, 'sleep 0.1', 3_000, 2);
+    const holder = start(['sleep', '30'], env, root);
+    try {
+        await waitFor(`${lock}.holder`);
+        expect((await finished(start(['sleep', '0.1'], { ...env, BUILDLOCK_TIMEOUT: '2' }, root), 4_000)).code).toBe(0);
+        // A head on memory for a while with a 35 GB budget; the holder is still ramping up, so it is protected.
+        writeFileSync(`${lock}.heavywait`, `${process.pid}\t${Math.floor(Date.now() / 1000) - 5}\t35000\n`);
+        const starved = await finished(start(['sleep', '0.1'], { ...env, BUILDLOCK_TIMEOUT: '0.5' }, root));
+        expect(starved.code).toBe(73);
+        expect(starved.stderr).toContain('for a heavy job that has waited longer');
+    } finally {
+        holder.kill('SIGTERM');
+        await finished(holder);
+    }
+}, 10_000);
