@@ -97,7 +97,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-bl_version=0.2.3
+bl_version=0.3.0
 bl_repo=Ice-Hazymoon/buildlock
 bl_home="https://github.com/$bl_repo"
 
